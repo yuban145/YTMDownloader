@@ -1,6 +1,16 @@
-"""Login browser — embedded web view for manual YouTube Music login.
-User logs in on music.youtube.com, then we extract cookies as Netscape format.
-No OAuth / Google API calls needed. Works behind firewalls.
+"""登录浏览器 — 内嵌 Web 视图用于手动登录 YouTube Music。
+
+工作原理（无 OAuth、无 Google API Key，适合内网/防火墙后）：
+  1. QWebEngineView 嵌入 music.youtube.com
+  2. cookieAdded 信号实时捕获 Qt 网络层 Cookie
+  3. 白名单检测认证 Cookie → 启用"完成登录"按钮
+  4. 输出两个文件：cookies.txt（Netscape 格式，给 yt-dlp）
+                    headers.json（HTTP headers + SAPISIDHASH，给 ytmusicapi）
+
+安全措施：
+  - 仅内存 Cookie（NoPersistentCookies），关闭后不留痕
+  - _AUTH_COOKIE_NAMES 白名单过滤，不保存广告/分析 Cookie
+  - Cookie 仅存本地，不上传任何服务器
 """
 
 import hashlib
@@ -268,10 +278,27 @@ class LoginBrowserWidget(QWidget):
 
 
 def _cookie_to_netscape(cookie: QNetworkCookie) -> str:
-    """Convert a QNetworkCookie to Netscape cookies.txt format line.
-    
-    Netscape format (TAB-separated):
+    """将 Qt Cookie 转换为 Netscape cookies.txt 格式（TAB 分隔）。
+
+    Netscape 格式规范（7 个字段，TAB 分隔）：
         domain  flag  path  secure  expires  name  value
+
+    示例行：
+        .youtube.com  TRUE  /  TRUE  2147483647  LOGIN_INFO  xxxxxx
+
+    字段说明：
+        domain   — 域名（.youtube.com）
+        flag     — TRUE=所有子域匹配（域名以 . 开头时），FALSE=精确匹配
+        path     — Cookie 有效路径（通常 /）
+        secure   — TRUE=仅 HTTPS
+        expires  — Unix 时间戳（秒）。会话 Cookie 用 2147483647（2038年）
+        name     — Cookie 名称
+        value    — Cookie 值
+
+    Args:
+        cookie: QNetworkCookie 实例
+    Returns:
+        Netscape 格式的 TAB 分隔行，转换失败返回空字符串
     """
     try:
         domain = cookie.domain()

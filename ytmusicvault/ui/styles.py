@@ -1,4 +1,22 @@
-"""Application-wide stylesheet (QSS)."""
+"""应用全局样式表（QSS — Qt Style Sheets）。
+
+基于 Catppuccin Mocha 配色方案的暗色主题：
+  - 背景：#1e1e2e（深蓝灰）
+  - 强调色：#89b4fa（蓝）
+  - 成功：#a6e3a1（绿）
+  - 警告：#f9e2af（黄）
+  - 错误：#f38ba8（红）
+
+覆盖组件：
+  QWidget, QMenuBar, QMenu, QPushButton, QLineEdit, QSpinBox, QComboBox,
+  QProgressBar, QScrollBar, QStatusBar, QDialog, QGroupBox, QCheckBox,
+  QSplitter, QTableWidget（#songTable）, 侧边栏（#sidebar）
+
+自定义选择器：
+  #sidebar, #sidebarTitle, #playlistCount — 侧边栏专用
+  #songTable — 歌曲表格
+  #secondaryBtn, #dangerBtn — 按钮变体
+"""
 
 DARK_THEME = """
 /* ── Global ────────────────────────────── */

@@ -1,4 +1,20 @@
-"""Main application window — orchestrates all UI and core logic."""
+"""主窗口 — 应用的核心控制器，编排所有 UI 和业务逻辑。
+
+职责（MVC 中的 Controller 角色）：
+  1. 持有所有核心组件引用（config, db, auth, ytm_client, downloader, queue）
+  2. 连接 UI 信号到业务逻辑（Sidebar 选择 → 加载歌曲 → 展示）
+  3. 管理登录流程（自动登录 / 内嵌浏览器登录 / Cookies 导入导出）
+  4. 编排下载流程（创建 Downloader → QueueManager → 后台线程）
+  5. 跨线程状态同步（下载线程 → Signal → 主线程 UI 更新）
+
+⚠️ 启动死锁风险分析：
+  - QTimer.singleShot(100ms, _auto_login)：延迟到事件循环运行后才执行，
+    避免在 QApplication.exec() 之前发起网络请求
+  - _load_library() 在**主线程**同步执行 HTTP 请求 → 大量歌曲时会 UI 冻结
+    建议：将 _load_library 移到后台线程
+  - closeEvent 未取消下载 → 线程写已关闭的 DB 连接会崩溃
+    建议：在 closeEvent 中调用 self._queue.cancel()
+"""
 
 import os
 import threading
@@ -28,23 +44,44 @@ from ..utils.config import AppConfig
 
 
 class MainWindow(QMainWindow):
-    """YtMusicVault main window."""
+    """YtMusicVault 主窗口 — 应用的中枢控制器。
 
-    # Signals for cross-thread communication
-    status_updated = Signal(Song)  # single song status change
-    progress_updated = Signal(str, float, str, str)  # video_id, percent, speed, eta
+    线程模型：
+      - 主线程：Qt 事件循环 + UI 更新
+      - 下载线程：QueueManager.start() 所在的后台线程
+      - Worker 线程：ThreadPoolExecutor 中的 _download_worker
+      - 跨线程通信：PySide6 Signal/Slot（自动排队到主线程）
+
+    持有组件：
+      Core:  config, db, auth, ytm_client, downloader, metadata, queue
+      UI:    sidebar, song_list, status_bar
+    """
+
+    # ═══════════════════════════════════════════════════════
+    # 信号定义（类属性）
+    # PySide6 Signal 是线程安全的 — 可以从任何线程 emit，
+    # slot 自动在主线程（接收者所在线程）执行。
+    # ═══════════════════════════════════════════════════════
+    status_updated = Signal(Song)                       # 单曲状态变更
+    progress_updated = Signal(str, float, str, str)     # video_id, percent, speed, eta
 
     def __init__(self):
+        """初始化主窗口 — 加载配置 → 创建数据库 → 构建 UI → 尝试自动登录。
+
+        初始化顺序有严格要求：UI 组件创建必须在核心组件之后，
+        因为 UI 回调可能立即访问 config/db/auth。
+        """
         super().__init__()
 
-        # ── Core components ────────────────────────────
-        self._config = AppConfig.load()
-        self._db = Database()
-        self._auth = AuthManager()
-        self._ytm: Optional[YtmClient] = None
-        self._downloader: Optional[Downloader] = None
-        self._metadata = MetadataWriter()
-        self._queue: Optional[QueueManager] = None
+        # ── 核心组件初始化 ────────────────────────────
+        # 顺序：config → db → auth（后两者依赖 config 中的路径）
+        self._config = AppConfig.load()       # 从磁盘加载用户偏好
+        self._db = Database()                 # SQLite 连接 + 建表
+        self._auth = AuthManager()            # Cookie 凭据管理
+        self._ytm: Optional[YtmClient] = None       # 登录后才创建
+        self._downloader: Optional[Downloader] = None # 下载时才创建
+        self._metadata = MetadataWriter()     # 元数据写入器（无状态）
+        self._queue: Optional[QueueManager] = None   # 下载时才创建
 
         # ── State ──────────────────────────────────────
         self._current_playlist_id: Optional[str] = None
@@ -352,7 +389,17 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _load_library(self, is_refresh: bool = False):
-        """Load user's playlists and liked songs."""
+        """加载用户音乐库（播放列表 + 喜欢的歌曲）。
+
+        ⚠️ 此方法在主线程同步执行 HTTP 请求！
+        对于拥有大量歌曲的用户（5000+），ytmusicapi 请求可能耗时
+        5-30 秒，期间 UI 完全冻结。processEvents() 仅在开头调用一次。
+
+        建议优化：将此方法移到后台线程，通过 Signal 返回结果。
+
+        Args:
+            is_refresh: True 表示手动刷新，False 表示首次加载
+        """
         if not self._ytm:
             return
 
@@ -641,7 +688,15 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def closeEvent(self, event):
-        """Save config on close."""
+        """窗口关闭事件 — 保存配置并清理资源。
+
+        ⚠️ 审查发现：此方法未取消进行中的下载任务。
+        如果用户在下载时关闭窗口，worker 线程可能继续尝试写入
+        已关闭的数据库连接，导致崩溃。
+        建议加上：
+            if self._queue and self._queue.is_running:
+                self._queue.cancel()
+        """
         self._config.window_width = self.width()
         self._config.window_height = self.height()
         self._config.save()

@@ -1,4 +1,17 @@
-"""Login dialog — provides embedded browser login and cookies import."""
+"""登录对话框 — 提供两种登录方式供用户选择。
+
+方法 1（推荐）：内嵌浏览器登录
+  - 在应用内直接打开 music.youtube.com
+  - 用户完成 Google 登录后自动提取 Cookie
+  - 无需浏览器扩展，无需手动操作
+
+方法 2：导入 Cookies 文件
+  - 支持 Netscape 格式（如浏览器扩展导出的 cookies.txt）
+  - 提供详细格式说明和获取指南（COOKIE_HELP_TEXT）
+
+数据流：
+  登录成功 → login_done 信号 → MainWindow 重新加载音乐库
+"""
 
 import webbrowser
 

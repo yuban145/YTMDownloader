@@ -1,4 +1,18 @@
-"""Settings dialog — configure download options and preferences."""
+"""设置对话框 — 配置下载选项、文件命名、代理等偏好。
+
+用户可配置项：
+  - 下载目录（带浏览按钮）
+  - 音质（best/256kbps/128kbps）
+  - 并发下载数（1-8）
+  - 失败重试次数（0-10）
+  - 重试间隔（1-60 秒）
+  - 文件名模板（{artist}, {title}, {album}, {track}, {ext}）
+  - 按播放列表创建子文件夹
+
+数据流：
+  MainWindow._open_settings() → SettingsDialog(config) → 修改 config → config.save()
+  对话框关闭时 config 已直接修改（非临时副本），调用方只需 save()。
+"""
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
