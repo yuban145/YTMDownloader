@@ -1,0 +1,5 @@
+PySide6>=6.5.0           # Qt UI framework (includes QtWebEngine for embedded browser)
+yt-dlp>=2024.0.0         # Audio download engine
+ytmusicapi>=1.5.0        # YouTube Music API client
+mutagen>=1.47.0          # Audio metadata writer
+requests>=2.31.0         # HTTP client
