@@ -1,4 +1,7 @@
 # **纯AI作品 谨慎使用！**
+# **纯AI作品 谨慎使用！**
+# **纯AI作品 谨慎使用！**
+
 # YtMusicVault — YouTube Music 批量下载器
 Windows 桌面应用，登录 YouTube Music 账号，批量下载个人收藏歌曲，自动写入封面和元数据，生成本地音乐库。
 
