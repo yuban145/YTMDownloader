@@ -122,6 +122,8 @@ class AuthManager:
             raise ValueError("Cookies 文件为空或所有 Cookie 均已过期")
         if not any(row[5] in auth_names for row in rows):
             raise ValueError("Cookies 文件中未找到 Google 登录凭据")
+        if not any(row[5] in {"__Secure-3PAPISID", "SAPISID", "APISID"} for row in rows):
+            raise ValueError("Cookies 文件中未找到 SAPISID 授权凭据")
 
         # Keep the original Netscape export for yt-dlp.
         os.makedirs(self._config_dir, exist_ok=True)
