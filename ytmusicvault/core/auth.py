@@ -71,18 +71,115 @@ class AuthManager:
 
     @property
     def has_cookies(self) -> bool:
-        """检测是否已有有效凭据。
-        
-        只检查 headers.json（ytmusicapi 需要），因为：
-          - 如果 headers.json 存在，cookies.txt 必然同时生成
-          - ytmusicapi 登录是加载音乐库的前提
-        
-        额外检查文件大小 > 0，防止空文件导致误判。
-        """
+        """Return whether a usable generated header file is present."""
         return (
-            os.path.exists(self._headers_path)
+            os.path.isfile(self._headers_path)
             and os.path.getsize(self._headers_path) > 0
+            and os.path.isfile(self._cookies_path)
+            and os.path.getsize(self._cookies_path) > 0
         )
+
+    def import_cookies(self, source_path: str) -> None:
+        """Import a Netscape cookies.txt and generate ytmusicapi headers.
+
+        Browser exports contain the cookies needed by yt-dlp, while
+        ytmusicapi expects a JSON headers file (including SAPISIDHASH).
+        Keeping this conversion here makes file import and embedded-browser
+        login use the same credential contract.
+        """
+        import shutil
+        import time
+        import hashlib
+
+        source = Path(source_path)
+        if not source.is_file():
+            raise ValueError("Cookies 文件不存在")
+        rows = []
+        auth_names = {
+            "LOGIN_INFO", "SID", "HSID", "SSID", "APISID", "SAPISID",
+            "__Secure-3PSID", "__Secure-3PAPISID",
+        }
+        with source.open("r", encoding="utf-8-sig", errors="replace") as f:
+            for line_no, raw_line in enumerate(f, 1):
+                line = raw_line.rstrip("\r\n")
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) != 7:
+                    raise ValueError(f"Cookies 文件第 {line_no} 行不是 7 列 Netscape 格式")
+                domain, flag, path, secure, expires, name, value = fields
+                if not domain or not path or not name:
+                    raise ValueError(f"Cookies 文件第 {line_no} 行包含空字段")
+                try:
+                    expiry = int(expires)
+                except ValueError as exc:
+                    raise ValueError(f"Cookies 文件第 {line_no} 行过期时间无效") from exc
+                if expiry and expiry < int(time.time()):
+                    continue
+                rows.append((domain, flag, path, secure, expires, name, value))
+
+        if not rows:
+            raise ValueError("Cookies 文件为空或所有 Cookie 均已过期")
+        if not any(row[5] in auth_names for row in rows):
+            raise ValueError("Cookies 文件中未找到 Google 登录凭据")
+        if not any(row[5] in {"__Secure-3PAPISID", "SAPISID", "APISID"} for row in rows):
+            raise ValueError("Cookies 文件中未找到 SAPISID 授权凭据")
+
+        # Keep the original Netscape export for yt-dlp.
+        os.makedirs(self._config_dir, exist_ok=True)
+        shutil.copy2(source, self._cookies_path)
+
+        # A request must contain one value per cookie name. Prefer the most
+        # specific domain when browser exports contain duplicates.
+        by_name = {}
+        domain_rank = lambda d: (
+            3 if d in ("music.youtube.com", "www.youtube.com") else
+            2 if "youtube.com" in d else
+            1 if "google.com" in d else 0
+        )
+        for row in rows:
+            current = by_name.get(row[5])
+            if current is None or domain_rank(row[0]) >= domain_rank(current[0]):
+                by_name[row[5]] = row
+        cookie_header = "; ".join(
+            f"{row[5]}={row[6]}" for row in by_name.values()
+        )
+
+        sapisid = ""
+        for name in ("__Secure-3PAPISID", "SAPISID", "APISID"):
+            if name in by_name:
+                sapisid = by_name[name][6]
+                break
+        timestamp = str(int(time.time()))
+        digest = hashlib.sha1(
+            f"{timestamp} {sapisid}".encode("utf-8")
+        ).hexdigest()
+        headers = {
+            "cookie": cookie_header,
+            "authorization": f"SAPISIDHASH {timestamp}_{digest}",
+            "x-goog-authuser": "0",
+            "x-origin": "https://music.youtube.com",
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "accept": "*/*",
+            "content-type": "application/json",
+        }
+        temp_path = self._headers_path + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(headers, f, indent=2)
+            os.replace(temp_path, self._headers_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        try:
+            os.chmod(self._cookies_path, 0o600)
+            os.chmod(self._headers_path, 0o600)
+        except OSError:
+            pass
 
     def login(self, proxy_url: str = "") -> Optional[YTMusic]:
         """用 headers.json 创建 YTMusic 实例。

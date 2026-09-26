@@ -244,12 +244,17 @@ class LoginDialog(QDialog):
             return
 
         try:
-            import shutil
-            shutil.copy2(path, self._auth.cookies_path)
-            QMessageBox.information(self, "导入成功", "Cookies 文件已导入！")
+            # AuthManager validates the Netscape export and also creates the
+            # headers.json required by ytmusicapi.
+            self._auth.import_cookies(path)
+            QMessageBox.information(
+                self,
+                "导入成功",
+                "Cookies 已导入并生成认证 headers，正在验证登录。",
+            )
             self._result = True
             self.login_done.emit()
-        except Exception as e:
+        except (ValueError, OSError) as e:
             QMessageBox.critical(
                 self,
                 "导入失败",
