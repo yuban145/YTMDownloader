@@ -1,5 +1,6 @@
-PySide6>=6.5.0           # Qt UI framework (includes QtWebEngine for embedded browser)
-yt-dlp>=2024.0.0         # Audio download engine
-ytmusicapi>=1.5.0        # YouTube Music API client
+PySide6>=6.5.0           # Qt desktop UI
+yt-dlp[default]>=2026.8.19 # Bundled downloader + YouTube JS challenge support
+ytmusicapi>=1.12.3,<2    # YouTube Music library access
 mutagen>=1.47.0          # Audio metadata writer
-requests>=2.31.0         # HTTP client
+requests[socks]>=2.31.0 # HTTP client and SOCKS proxies
+psutil>=7.2.2            # Stop yt-dlp/ffmpeg process trees on cancel or timeout

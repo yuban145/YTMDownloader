@@ -26,5 +26,6 @@ class Playlist:
     description: str = ""         # 播放列表描述
     count: int = 0                # YouTube Music 报告的歌曲数量
     thumbnail: str = ""           # 封面缩略图 URL
+    owned: bool = False           # 用户创建或收藏的歌单
     is_liked: bool = False        # 是否为"我喜欢"特殊播放列表
     songs: List[Song] = field(default_factory=list)  # 播放列表中的歌曲（延迟加载）

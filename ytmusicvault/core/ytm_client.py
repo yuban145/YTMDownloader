@@ -1,267 +1,207 @@
-"""YouTube Music API 客户端封装
-
-对 ytmusicapi 库的薄封装层，职责：
-  1. 调用 ytmusicapi 的 API 方法（get_liked_songs, get_playlist 等）
-  2. 将 ytmusicapi 的复杂嵌套字典响应解析为 Song/Playlist 数据类
-  3. 处理 YouTube Music API 的两种数据格式（flat string 和 runs[] 嵌套结构）
-
-数据格式说明：
-  YouTube Music API 的字段可能是：
-    - 简单字符串：{"title": "Bohemian Rhapsody"}
-    - runs[] 嵌套：{"title": {"runs": [{"text": "Bohemian Rhapsody"}]}}
-  本模块统一处理这两种格式。
-"""
-
-from typing import List, Optional
-
+"""YouTube Music service: bounded HTTP requests and robust domain parsing."""
+import re
+import threading
+from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlparse
+import requests
 from ytmusicapi import YTMusic
-
+from .auth import AuthError
 from ..models.song import Song
 from ..models.playlist import Playlist
 from ..utils.helpers import format_duration
+from ..utils.proxy import configure_requests_session
+
+
+class Cancelled(Exception): pass
+class SessionExpired(AuthError): pass
+class ServiceError(Exception): pass
+
+
+class HttpSession(requests.Session):
+    def __init__(self, cancel_event=None):
+        super().__init__()
+        self.cancel_event = cancel_event or threading.Event()
+
+    def request(self, method, url, **kwargs):
+        if self.cancel_event.is_set():
+            raise Cancelled()
+        kwargs["timeout"] = (10, 30)
+        response = super().request(method, url, **kwargs)
+        if self.cancel_event.is_set():
+            raise Cancelled()
+        if response.status_code in (401, 403):
+            raise SessionExpired("登录已过期或账号无权限，请重新登录并确认账号序号。")
+        response.raise_for_status()
+        return response
+
+
+def user_error(exc):
+    if isinstance(exc, (AuthError, ServiceError)):
+        return str(exc)
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return "代理连接失败，请检查代理地址、端口和运行状态。"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "HTTPS 证书校验失败，请检查系统时间或代理证书。"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "请求超时，请检查网络或代理后重试。"
+    if isinstance(exc, requests.exceptions.RequestException):
+        return "网络请求失败，请检查网络或代理后重试。"
+    return "服务返回了无法解析的数据，请重试；持续失败时请更新 ytmusicapi。"
+
+
+@dataclass
+class TrackBatch:
+    songs: list[Song] = field(default_factory=list)
+    skipped: int = 0
 
 
 class YtmClient:
-    """封装 ytmusicapi，提供类型安全的 Song/Playlist 返回。
-    
-    所有公共方法返回 Song 或 Playlist 对象列表，
-    而非原始的 dict 嵌套结构，隔离了 API 响应格式变化。
-    """
+    def __init__(self, ytm, session=None):
+        self._ytm, self._session = ytm, session
 
-    def __init__(self, ytm: YTMusic):
-        """注入已认证的 YTMusic 实例。
-        
-        Args:
-            ytm: 已通过 AuthManager.login() 创建的 YTMusic 实例
-        """
-        self._ytm = ytm
-
-    # ── "我喜欢" 歌曲 ─────────────────────────────────────
-
-    def get_liked_songs(self, limit: int = 5000) -> List[Song]:
-        """获取用户"我喜欢"（点赞）的所有歌曲。
-        
-        limit=5000 是 ytmusicapi 的默认上限，覆盖绝大多数用户的收藏量。
-        
-        Returns:
-            Song 对象列表（已解析，可直接显示/下载）
-        """
-        # ytmusicapi 返回 {"tracks": [...]} 结构
-        raw = self._ytm.get_liked_songs(limit=limit)
-        songs = []
-        if "tracks" in raw:
-            for track in raw["tracks"]:
-                song = self._parse_track(track)
-                if song:
-                    songs.append(song)
-        return songs
-
-    # ── 用户播放列表 ──────────────────────────────────────
-
-    def get_playlists(self) -> List[Playlist]:
-        """获取用户创建和收藏的所有播放列表。
-        
-        注：此方法只返回播放列表元数据（标题、数量等），
-        不包含歌曲列表。歌曲通过 get_playlist_songs() 按需加载。
-        
-        Returns:
-            Playlist 对象列表（songs 字段为空）
-        """
-        raw = self._ytm.get_library_playlists(limit=100)
-        playlists = []
-        for item in raw:
-            playlist = Playlist(
-                playlist_id=item.get("playlistId", ""),
-                title=item.get("title", "Untitled"),
-                description=item.get("description", ""),
-                count=int(item.get("count", 0)),
-                # 选择最高分辨率缩略图
-                thumbnail=_best_thumbnail(item.get("thumbnails", [])),
-            )
-            playlists.append(playlist)
-        return playlists
-
-    # ── 播放列表内容 ──────────────────────────────────────
-
-    def get_playlist_songs(self, playlist_id: str) -> List[Song]:
-        """获取指定播放列表中的所有歌曲。
-        
-        与 get_playlists() 分离的设计原因：
-          用户可能有很多播放列表，但每次只查看一个。
-          按需加载避免启动时加载全部歌曲导致 UI 卡顿。
-        
-        Args:
-            playlist_id: YouTube Music 播放列表 ID
-        Returns:
-            Song 对象列表
-        """
-        raw = self._ytm.get_playlist(playlist_id=playlist_id, limit=5000)
-        songs = []
-        if "tracks" in raw:
-            for track in raw["tracks"]:
-                song = self._parse_track(track)
-                if song:
-                    songs.append(song)
-        return songs
-
-    # ── 搜索 ──────────────────────────────────────────────
-
-    def search(self, query: str, limit: int = 20) -> List[Song]:
-        """在 YouTube Music 中搜索歌曲。
-        
-        filter="songs" 确保只返回歌曲结果（不含视频、专辑、艺人等）。
-        
-        Args:
-            query: 搜索关键词
-            limit: 返回结果数量上限
-        Returns:
-            匹配的 Song 对象列表
-        """
-        raw = self._ytm.search(query=query, filter="songs", limit=limit)
-        songs = []
-        for item in raw:
-            # resultType 过滤：只保留 "song" 类型的结果
-            if item.get("resultType") == "song":
-                song = self._parse_track(item)
-                if song:
-                    songs.append(song)
-        return songs
-
-    # ── 解析引擎 ──────────────────────────────────────────
-
-    def _parse_track(self, raw: dict) -> Optional[Song]:
-        """将 ytmusicapi 的原始 track 字典解析为 Song 对象。
-        
-        这是整个模块最核心的方法，负责处理：
-          1. 两种标题/艺术家格式（flat string vs runs[] 嵌套）
-          2. 多种时长格式（"3:45", "1:23:45"）
-          3. 缺失字段的默认值处理
-        
-        Args:
-            raw: ytmusicapi 返回的单首歌曲字典
-        Returns:
-            Song 对象，缺少 video_id 或解析异常时返回 None
-        """
+    @classmethod
+    def connect(cls, credentials, proxy_url=None, cancel_event=None):
+        session = HttpSession(cancel_event)
+        proxies = configure_requests_session(session, proxy_url)
         try:
-            # video_id 是必须字段，没有则无法下载
-            video_id = raw.get("videoId", "")
-            if not video_id:
-                return None
-
-            # 标题解析 — 兼容两种格式
-            title = raw.get("title", "Unknown")
-            if isinstance(title, dict):
-                # runs[] 格式: {"runs": [{"text": "歌名"}]}
-                title = title.get("runs", [{}])[0].get("text", "Unknown")
-
-            # 艺术家解析 — 可能有多个艺术家
-            artists = []
-            artist_list = raw.get("artists", [])
-            for a in artist_list:
-                name = a.get("name", "")
-                if isinstance(name, dict):
-                    # runs[] 格式兼容
-                    name = name.get("runs", [{}])[0].get("text", "")
-                if name:
-                    artists.append(name)
-            # 多个艺术家用 ", " 拼接，无艺术家时用 "Unknown Artist"
-            artist = ", ".join(artists) if artists else "Unknown Artist"
-
-            # 专辑 — 可能在 album.name 中
-            album = ""
-            album_data = raw.get("album", {})
-            if isinstance(album_data, dict):
-                album = album_data.get("name", "")
-
-            # 时长 — 从 "mm:ss" 字符串转换为秒数
-            duration_str = raw.get("duration", "0:00")
-            duration_sec = _parse_duration_seconds(duration_str)
-
-            # 缩略图 — 选择最高分辨率
-            thumbnails = raw.get("thumbnails", [])
-            thumbnail = _best_thumbnail(thumbnails)
-
-            # 曲目号 — 可能是 trackNumber 或 track_number
-            track_number = 0
+            api = YTMusic(auth=dict(credentials.headers), requests_session=session,
+                          proxies=proxies or None, language="en",
+                          user=credentials.headers.get("x-goog-pageid"))
+            # Identity is best-effort only: never make login or playlist access
+            # depend on this extra endpoint. The original library flow stays
+            # unchanged if account-menu parsing/network access fails.
+            account = {"accountName": "账号未验证", "verified": False, "identityAvailable": False}
             try:
-                tn = raw.get("trackNumber") or raw.get("track_number", 0)
-                if tn:
-                    track_number = int(tn)
-            except (ValueError, TypeError):
-                pass  # 无法解析则保持 0
-
-            # 发行年份
-            year = 0
-            try:
-                yr = raw.get("year", 0)
-                if yr:
-                    year = int(yr)
-            except (ValueError, TypeError):
-                pass  # 无法解析则保持 0
-
-            return Song(
-                video_id=video_id,
-                title=title,
-                artist=artist,
-                album=album,
-                duration=duration_sec,
-                duration_str=duration_str,
-                thumbnail=thumbnail,
-                track_number=track_number,
-                year=year,
-            )
+                identity = api.get_account_info()
+                if isinstance(identity, dict) and identity.get("accountName"):
+                    account.update(identity)
+                    # Keep the existing session-persistence gate unchanged;
+                    # this extra response is only for the account-switch label.
+                    account["verified"] = False
+                    account["identityAvailable"] = True
+            except Exception:
+                pass
+            return cls(api, session), account
         except Exception:
-            # 单首歌曲解析失败不应影响整个列表
-            # ⚠️ 审查: 建议至少记录 _log.warning 再返回 None
+            session.close()
+            raise
+
+    def account(self):
+        try:
+            account = self._ytm.get_account_info()
+        except (KeyError, IndexError):
+            raise SessionExpired("无法确认登录账号，请在浏览器完成 YouTube Music 登录后重新导入。") from None
+        if not isinstance(account, dict) or not account.get("accountName"):
+            raise SessionExpired("服务器未返回登录账号，请重新登录。")
+        return account
+
+    def close(self):
+        if self._session:
+            self._session.close()
+
+    def get_playlists(self):
+        # Keep the original library endpoint and limit from the working flow.
+        raw = self._ytm.get_library_playlists(limit=100)
+        if not isinstance(raw, list):
+            raise ServiceError("播放列表响应异常，请重试。")
+        result, seen = [], set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("playlistId")
+            if not pid or pid in seen or pid == "LM":
+                continue
+            seen.add(pid)
+            result.append(Playlist(playlist_id=pid, title=_text(item.get("title")) or "未命名歌单",
+                                   count=_number(item.get("count")), thumbnail=_best_thumbnail(item.get("thumbnails")),
+                                   description=_text(item.get("description")), owned=bool(item.get("owned"))))
+        return result
+
+    def get_tracks(self, playlist_id):
+        pid = parse_playlist_id(playlist_id)
+        # First-version liked songs used the dedicated endpoint. Current
+        # ytmusicapi accepts playlistId (positional), not playlist_id.
+        raw = (self._ytm.get_liked_songs(limit=5000) if pid == "LM" else
+               self._ytm.get_playlist(pid, limit=5000))
+        if not isinstance(raw, dict) or not isinstance(raw.get("tracks"), list):
+            raise ServiceError("无法获取歌曲：歌单可能已删除、设为私密，或当前账号没有权限。")
+        batch = TrackBatch()
+        for track in raw["tracks"]:
+            song = self._parse_track(track)
+            if song is None:
+                batch.skipped += 1
+            else:
+                batch.songs.append(song)
+        return batch
+
+    def get_liked_songs(self):
+        return self.get_tracks("LM").songs
+
+    def get_playlist_songs(self, playlist_id):
+        return self.get_tracks(playlist_id).songs
+
+    @staticmethod
+    def _parse_track(raw):
+        if not isinstance(raw, dict) or not raw.get("videoId") or raw.get("isAvailable") is False:
             return None
+        artists = raw.get("artists") or []
+        if not isinstance(artists, list):
+            artists = []
+        artist = ", ".join(filter(None, (_text(a.get("name")) for a in artists if isinstance(a, dict))))
+        album = raw.get("album")
+        seconds = _number(raw.get("duration_seconds")) or _parse_duration_seconds(raw.get("duration"))
+        return Song(video_id=str(raw["videoId"]), title=_text(raw.get("title")) or "未知标题",
+                    artist=artist or "未知艺术家", album=_text(album.get("name")) if isinstance(album, dict) else "",
+                    duration=seconds, duration_str=format_duration(seconds),
+                    thumbnail=_best_thumbnail(raw.get("thumbnails")),
+                    track_number=_number(raw.get("trackNumber") or raw.get("track_number")),
+                    year=_number(raw.get("year")))
 
 
-# ═══════════════════════════════════════════════════════════
-# 模块级工具函数
-# ═══════════════════════════════════════════════════════════
-
-def _best_thumbnail(thumbnails: list) -> str:
-    """从缩略图列表中选择最高分辨率的 URL。
-    
-    按 width × height 乘积排序，选最大的。
-    
-    Args:
-        thumbnails: [{"url": "...", "width": 120, "height": 90}, ...]
-    Returns:
-        最高分辨率缩略图的 URL 字符串
-    """
-    if not thumbnails:
-        return ""
-    # max() 的 key 参数按像素总数排序
-    best = max(
-        thumbnails,
-        key=lambda t: (t.get("width", 0) * t.get("height", 0)),
-        default={}
-    )
-    return best.get("url", "")
+def parse_playlist_id(value):
+    value = value.strip()
+    if "://" in value:
+        url = urlparse(value)
+        if url.scheme not in ("https", "http") or url.hostname not in ("youtube.com", "www.youtube.com", "music.youtube.com"):
+            raise ServiceError("请输入 YouTube 或 YouTube Music 播放列表链接。")
+        value = parse_qs(url.query).get("list", [""])[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ServiceError("无效的播放列表 ID 或链接。")
+    return value
 
 
-def _parse_duration_seconds(dur: str) -> int:
-    """将时长字符串解析为秒数。
-    
-    支持格式：
-      "3:45"     → 225 秒 (mm:ss)
-      "1:23:45"  → 5025 秒 (h:mm:ss)
-      "45"       → 45 秒 (ss)
-    
-    Args:
-        dur: 时长字符串
-    Returns:
-        总秒数，解析失败返回 0
-    """
-    if not dur:
+def _text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return "".join(str(r.get("text", "")) for r in value.get("runs", []) if isinstance(r, dict))
+    return ""
+
+
+def _number(value):
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        match = re.fullmatch(r"([\d,\s]+)(?: songs?| tracks?| 首.*)?", value.strip())
+        if match:
+            digits = re.sub(r"\D", "", match[1])
+            return int(digits) if digits else 0
+    return 0
+
+
+def _parse_duration_seconds(value):
+    if not isinstance(value, str):
         return 0
-    parts = dur.strip().split(":")
-    try:
-        if len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-        elif len(parts) == 2:
-            return int(parts[0]) * 60 + int(parts[1])
-        return int(parts[0])
-    except (ValueError, IndexError):
+    parts = value.split(":")
+    if len(parts) > 3 or not all(p.isdigit() for p in parts):
         return 0
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds
+
+
+def _best_thumbnail(thumbnails):
+    valid = [t for t in (thumbnails or []) if isinstance(t, dict) and t.get("url")]
+    return max(valid, key=lambda t: _number(t.get("width")) * _number(t.get("height")),
+               default={}).get("url", "")

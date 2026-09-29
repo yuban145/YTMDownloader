@@ -9,6 +9,8 @@ build/
 # Virtual environment
 venv/
 .venv/
+.venv-build/
+source-smoke.txt
 
 # IDE
 .vscode/

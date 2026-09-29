@@ -1,305 +1,105 @@
-# YtMusicVault 使用指南
+# YtMusicVault 2.1 使用指南
 
-YouTube Music 批量下载器 — 将您的 YouTube Music 歌单变成本地音乐文件。
+## 1. 启动与登录
 
----
+运行 dist 中的新 YtMusicVault.exe，或从项目虚拟环境运行 main.py。首次使用默认跟随系统代理，不用填写地址。程序支持 Windows 静态代理和 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等环境变量，主窗口显示脱敏后的代理状态。只有系统使用 PAC 自动配置脚本时，需要代理软件提供静态系统代理；本程序不解析 PAC。
 
-## 📑 目录
+可先在常用浏览器访问 [YouTube Music](https://music.youtube.com) 登录，也可点击程序「添加账号」→「在内置浏览器登录」。内置浏览器使用只保存在内存的独立会话，完成登录后点击「使用当前 Cookie」。若 Google 拒绝内嵌登录，使用下述浏览器会话或 Cookie 文件方式即可。内置浏览器用于取得新鲜 Cookie，**不能替代 yt-dlp 对播放器 JavaScript 的解析**。
 
-1. [快速开始](#快速开始)
-2. [登录账号](#登录账号)
-3. [浏览歌单](#浏览歌单)
-4. [下载歌曲](#下载歌曲)
-5. [设置说明](#设置说明)
-6. [Cookies 文件格式](#cookies-文件格式)
-7. [常见问题](#常见问题)
+新版顶部提供「添加账号」「重新登录」和账号下拉框。抓取到 Google 账号名称时会优先显示该名称；暂时无法获取时保留账号备注。添加账号时先填备注，再在登录窗口选择会话来源；「记住登录」默认不勾选，可自行启用。只有按原有验证流程读到个人歌单或收藏曲目后，账号才会加入已保存账号列表。切换账号不会修改其他账号的 Cookie，也不会清除下载历史。旧版单账号会话仍从原位置读取。
 
----
+### 方式 A：读取浏览器会话
 
-## 🚀 快速开始
+1. 选择 Edge、Chrome、Firefox 等浏览器；存在配置目录的浏览器会显示「已检测到」。
+2. 可指定配置文件，例如 Chromium 浏览器的 Default / Profile 1，或浏览器配置目录完整路径。留空时由 yt-dlp 选择配置。
+3. 一个浏览器登录了多个 Google 账号时，可调整账号序号（通常从 0 开始）；品牌频道优先用方式 B。
+4. 点击「连接音乐库」。读取会话和音乐库请求在后台完成；账号信息接口不是登录前置条件。
 
-### 安装
+检测到目录不等于能读取 Cookie，也不等于账号已登录。浏览器文件锁、Windows 加密保护都可能导致导入失败。可以关闭对应浏览器后重试；若仍失败，直接使用请求头方式，无需禁用浏览器安全机制。
 
-```bash
-# 1. 确保安装了 Python 3.11+ 和 yt-dlp
-pip install yt-dlp
+### 方式 B：粘贴请求头（自动读取失败时使用）
 
-# 2. 安装项目依赖
-pip install -r requirements.txt
+1. 在已登录的 YouTube Music 页面按 F12，打开「网络 / Network」面板。
+2. 在音乐库中打开一个歌单，筛选 browse，选择发送到 music.youtube.com 的 /youtubei/v1/browse POST 请求。
+3. 在「请求头 / Request Headers」中复制完整请求头文本（Chrome / Edge 可选「查看源代码」），粘贴到程序「请求头登录」页。也接受以请求头名称为键的 JSON；不要粘贴整段 fetch / cURL 命令或响应正文。
+4. 确认包含 Cookie。多账号请保留 X-Goog-AuthUser，品牌频道请保留 X-Goog-PageId（如果请求中存在）。
+5. 点击「连接音乐库」，核对主窗口里的实际歌单和歌曲。
 
-# 3. 启动
-python main.py
+程序从登录 Cookie 生成请求签名，保留账号和频道选择，不复用过期的 Authorization 值。需要有效的 YouTube 域 __Secure-3PAPISID；缺失时请重新登录、刷新页面后复制，勿伪造或从别的域拼接。
+
+参考：[ytmusicapi 的浏览器认证说明](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html)。
+
+### 方式 C：导入 Cookie 文件
+
+选择 Netscape cookies.txt 文件，再指定账号序号并验证。文件应来自已登录的 YouTube / YouTube Music 页面，采用 TAB 分隔的标准七字段格式。程序忽略非 YouTube 域和已过期项，兼容到期时间为 0 的会话 Cookie。
+
+文件格式有效不代表账号已登录。程序沿用早期版本的音乐库请求方式，界面会标明「账号身份未验证」；若预期有收藏却显示空列表，请重新导出完整 Cookie。格式错误的输入不会覆盖之前保存的会话。
+
+真实下载冒烟测试可运行 `tests/manual_real_cookie_smoke.py <cookies.txt> http://127.0.0.1:7890`。它使用导出文件的临时副本下载五秒真实片段，检查音视频流和分辨率，不改写源 Cookie。必须使用您有权下载的内容；示例 URL 可在脚本中替换。
+
+## 2. 记住登录与隐私
+
+「记住登录」默认不勾选；不勾选时账号会话只在本次运行使用。由于账号身份接口不再作为前置条件，只有实际读到个人歌单或「我喜欢」歌曲后才会写入新会话或清除旧会话；空列表不会覆盖先前保存的会话。
+
+勾选后，会话以**明文**存放在 %APPDATA%\YtMusicVault\session.json，包括导入的 YouTube Cookie 字段。它具有账号访问能力，请勿分享、提交到 Git 或上传排错报告。程序不在日志中显示 Cookie 值；下载时会生成保留原始域名和有效期的临时 cookies.txt，通过 yt-dlp 的 `--cookies` 参数传入，任务结束后清理。即使未记住登录，下载期间仍需要这些临时文件。
+
+「退出登录」清除应用的 session.json 及旧版 headers.json / cookies.txt，不会清除浏览器中的 Google 登录。会话失效时不自动破坏原文件，可重新导入验证；崩溃或异常关机可能留下系统临时文件，请注意电脑和用户目录的访问权限。
+
+多账号模式下，「退出登录」只清除当前账号的会话并从账号列表移除，不影响其他账号；`accounts.json` 只保存账号备注和选择，不存放 Cookie。其他账号会话分别位于 `%APPDATA%\YtMusicVault\profiles\<账号ID>\session.json`，同样是明文敏感文件。
+
+旧版 headers.json 或 cookies.txt 可在启动时尝试验证并迁移为新会话格式。原有配置、下载文件及数据库记录保留。
+
+## 3. 获取和浏览歌单
+
+- 连接后自动加载「我喜欢」和音乐库播放列表。
+- 沿用早期版本的歌单接口与上限：播放列表最多请求 100 个，「我喜欢」和单个歌单最多请求 5000 首；界面仍可交互。
+- 左侧搜索歌单，右侧搜索标题、艺术家或专辑。
+- 点击「刷新音乐库」重新拉取歌单和当前歌曲；失败时可「重试加载」。
+- 「打开歌单链接」接受 YouTube Music / YouTube 播放列表 URL 或 ID；未加入个人音乐库的可访问歌单也可以打开。
+- 已删除、地区不可用、没有视频 ID 的条目会跳过并统计；重复出现在歌单中的歌曲保留显示，下载时按视频 ID 去重。
+- 切换歌单或退出账号后，旧请求结果不会再覆盖当前页面。
+
+音乐库内容依赖当前 Google 账号 / 频道和服务端可见性。空列表和请求失败会分别显示，但空列表不能证明 Cookie 有效。歌单与预期不符时，先检查 Cookie 是否包含完整登录会话、账号序号与 Page ID，而不是重复下载。
+
+下载进行中需先完成或取消，才可切换账号或退出登录。这样下载使用的会话与选歌账号保持一致。
+
+## 4. 下载和本地播放
+
+下载器已内置 yt-dlp 和 EJS 验证组件，不再依赖 PATH 中的 yt-dlp.exe。请确认 ffmpeg、ffprobe，以及 Deno 或 Node.js 可从 PATH 找到；后者用于 YouTube JavaScript 验证。
+
+在主窗口选择 **MV 最高画质 / 单独音频 FLAC / 单独音频 MP3**，然后勾选歌曲点「下载选中」，或点「下载整个歌单」将当前已加载歌单批量加入队列。已按相同类型和格式下载且文件仍存在的歌曲会跳过。设置中可选输出目录、并发数、重试次数、文件名模板；0 次重试表示只尝试一次。「取消下载」停止当前批次，可稍后重试失败或取消的歌曲。
+
+下载开始后自动进入「下载」页。「本次任务」展示解析、验证、媒体流下载、合并 / 转码、写入标签等阶段及速度、进度；可取消当前批次或重试失败任务。「已下载」读取本机记录，重启后仍可查看。双击已完成项目默认用系统播放器打开本地文件；右键也可打开本地文件或源页面。日志页显示详细事件，并保存到 `%APPDATA%\YtMusicVault\logs\download.log`（轮换保留上一份）；日志不记录 Cookie 或原始网络响应。文件被移动后会显示“文件不存在”，不会删除下载记录。
+
+主窗口默认选择 **MV · 最高画质**，使用 `bv*+ba/b` 获取最高可用视频与音频，按分辨率、帧率排序，不加 1080p、MP4、H.264 等限制。默认以 **MKV** 容器无损合并，不重新编码视频。实际能获取的最高画质仍取决于源视频、账号权限、区域和平台验证。播放器需支持源视频所用的 AV1 / VP9 等编码。
+
+歌单中的官方 MV / 用户视频直接下载；专辑音轨先查询 YouTube Music 提供的对应视频（counterpart），找不到则提示“没有对应 MV”，不会擅自搜索下载另一个版本，也不会将封面音轨当作 MV。可改用音频模式，或打开包含实际 MV 的歌单。
+
+选择 **单独音频 · FLAC** 时使用最佳可用源音频；选择 **单独音频 · MP3** 时可在设置里选最佳质量、256 或 128 kbps。FLAC 不会恢复 YouTube 源音频中已损失的音质；转码码率也不是源音质保证。MV 不受音频码率选项影响，保留最佳音频码流。
+
+所有格式都会写入标题、作者 / 艺术家（MP3 的 Artist / Album Artist、FLAC 的 artist / albumartist）、可用的专辑 / 曲目号 / 年份，并尝试嵌入封面。MKV 标签通过 FFmpeg stream copy 写入；M4A、MP3、FLAC 使用 mutagen。没有的数据不会补造，元数据写入失败不会记作成功。
+
+MV 和音频分别保存在 MV / Audio 子目录，文件名自动带视频 ID；MV、FLAC、MP3 分别记录，下载过一种格式不会跳过另一种。旧版历史保留为兼容音频记录，不删除旧数据库表或媒体文件；只有记录和文件均存在才显示完成。
+
+## 5. 常见问题
+
+**QtWidgets DLL 启动错误**：使用重新构建的新版 EXE。项目 Spec 排除了可能误从其他软件目录收集的 icuuc.dll；内置浏览器所需的 QtWebEngine 由打包脚本包含。请用 build.ps1 构建，使源码和真实 EXE 启动检查都执行。
+
+**自动 Cookie 导入失败**：确认选对浏览器和配置文件；关闭浏览器后重试。Windows 加密保护不保证可由 yt-dlp 解密，使用方式 B 作为替代。
+
+**登录已过期 / 无权限**：重新从正确账号 / 频道导入。403 也可能是服务拒绝请求，不一定是 Cookie 格式问题。品牌账号用请求头方式保留频道信息。
+
+**网络 / 代理失败**：首次使用默认跟随系统，确认代理软件正在运行并已开启系统代理。音乐库登录、歌单请求、MV 查询、媒体下载和封面请求都会采用对应代理设置；系统代理会读取 Windows 静态代理和代理环境变量。设置里另有「手动代理」和「直连」。旧版本启用的手动代理不会被自动覆盖。更改代理后，已连接的音乐库会话需重新登录以采用新设置。
+
+**yt-dlp 下载失败**：程序会区分代理、FFmpeg、登录、格式和 JavaScript 验证错误，但不会回显含 Cookie / 密码的原始日志。请使用最新构建（只更新外部 yt-dlp.exe 不影响内置版本），并检查 FFmpeg、Deno / Node.js、网络和会话。本程序不会绕过 DRM 或访问权限限制。
+
+**提供反馈**：可提供错误提示和使用步骤；不要发送 Cookie、Authorization、session.json 或完整请求头。
+
+## 6. 开发验证
+
+```powershell
+.\.venv-build\Scripts\python.exe -B -m unittest discover -s tests -v
+.\build.ps1 -SkipInstall -PythonPath .\.venv-build\Scripts\python.exe
 ```
 
-### 打包为 .exe（无需 Python 环境）
-
-```bash
-pip install pyinstaller
-pyinstaller YtMusicVault.spec
-# 生成的 .exe 在 dist/YtMusicVault.exe
-```
-
----
-
-## 🔐 登录账号
-
-YtMusicVault 提供两种登录方式：
-
-### 方法一：OAuth 浏览器登录（推荐 ⭐）
-
-1. 点击菜单 **账号 → 登录 OAuth**
-2. 确认后会**自动打开浏览器**
-3. 在浏览器中**登录您的 Google 账号**并授权
-4. 完成后浏览器自动关闭，应用会自动加载您的音乐库
-
-> ✅ 优点：安全、无需手动处理密码、自动刷新凭据
-> ⚠ 前提：电脑上需要有浏览器（Chrome/Edge/Firefox）
-
-### 方法二：导入 Cookies 文件
-
-如果 OAuth 无法使用（如服务器环境），可以手动导入 Cookies：
-
-1. **获取 Cookies 文件**（见下方 [Cookies 文件格式](#cookies-文件格式)）
-2. 点击菜单 **账号 → 导入 Cookies**
-3. 选择导出的 `.txt` 文件
-4. 应用会自动验证文件格式并登录
-
-> 详细格式说明见 [Cookies 文件格式](#cookies-文件格式) 章节
-
----
-
-## 📋 浏览歌单
-
-登录成功后，左侧边栏会显示：
-
-```
-📁 音乐库
-├── ❤️ 我喜欢 (1,234首)
-├── 🎵 Chill
-├── 🎵 Workout
-└── 🎵 Study
-```
-
-- 点击 **❤️ 我喜欢** 查看所有点赞歌曲
-- 点击 **🎵 播放列表名** 查看该列表中的歌曲
-- 右侧的歌曲列表支持 **搜索过滤**：在搜索框中输入歌名或作者即可筛选
-
----
-
-## ⬇ 下载歌曲
-
-### 基本下载流程
-
-1. **勾选** 要下载的歌曲（支持全选）
-2. 点击底部 **⬇ 下载选中** 按钮
-3. 查看**状态栏**的实时进度
-
-### 进度显示
-
-```
-████████████░░░░░░ 65%   15/50   ⬇ 2.3MB/s   剩余 8 分钟
-├─ 总体进度条       ├─ 已完成/总数    ├─ 速度       └─ 预计剩余时间
-```
-
-### 列表中的状态标识
-
-| 图标 | 含义 |
-|------|------|
-| ⏳ 待下载 | 等待开始 |
-| ⬇ 下载中 | 正在下载 |
-| ✅ 已完成 | 下载成功 |
-| ❌ 失败 | 下载出错 |
-| ⏸ 暂停 | 已暂停 |
-| ⏭ 跳过 | 之前已下载，自动跳过 |
-
-### 断点续传
-
-- 已成功下载的歌曲会**自动跳过**，不会重复下载
-- 下载记录保存在本地 SQLite 数据库中
-- 即使关闭应用重新打开，已下载的歌曲仍标记为 ✅
-
----
-
-## ⚙ 设置说明
-
-点击菜单 **设置 → 偏好设置** 可配置以下选项：
-
-### 下载设置
-
-| 设置项 | 默认值 | 说明 |
-|--------|--------|------|
-| 下载目录 | `~/Music/YtMusicVault/` | 文件保存位置 |
-| 音质 | 256 kbps | 128/256/最佳 |
-| 并发数 | 4 | 同时下载 1-8 首 |
-| 失败重试 | 3 次 | 下载失败自动重试 |
-| 重试间隔 | 5 秒 | 每次重试等待时间 |
-
-### 文件命名
-
-| 设置项 | 默认值 | 说明 |
-|--------|--------|------|
-| 文件名模板 | `{artist} - {title}.{ext}` | 可用变量：`{artist}`, `{title}`, `{album}`, `{track}`, `{ext}` |
-| 按播放列表建文件夹 | 开启 | 每个播放列表创建单独子文件夹 |
-
-### 命名示例
-
-```
-模板: {artist} - {title}.{ext}
-结果: 周杰伦 - 七里香.m4a
-
-模板: {track}. {title}.{ext}
-结果: 01. 七里香.m4a
-
-模板: {artist}/{album}/{track} - {title}.{ext}
-结果: 周杰伦/七里香/03 - 借口.m4a
-```
-
----
-
-## 📄 Cookies 文件格式
-
-### 什么是 Cookies 文件？
-
-Cookies 是浏览器存储的登录状态信息。将 YouTube Music 的 Cookies 导出为特定格式的文件后，应用可以直接使用这些信息登录，无需再次通过浏览器授权。
-
-### 支持格式：Netscape HTTP Cookies
-
-文件必须是 **TAB 分隔** 的 Netscape 格式，示例：
-
-```
-# Netscape HTTP Cookie File
-# https://curl.se/docs/http-cookies.html
-.youtube.com	TRUE	/	TRUE	1798765432	CONSENT	YES+
-.youtube.com	TRUE	/	FALSE	1798765432	VISITOR_INFO1_LIVE	abc123def456
-.youtube.com	TRUE	/	FALSE	1798765432	LOGIN_INFO	xxxxxxxxxxxxx
-.youtube.com	TRUE	/	FALSE	1798765432	SID	xxxxxxxxxxxxx
-.youtube.com	TRUE	/	FALSE	1798765432	HSID	xxxxxxxxxxxxx
-.youtube.com	TRUE	/	FALSE	1798765432	SSID	xxxxxxxxxxxxx
-.youtube.com	TRUE	/	TRUE	1798765432	APISID	xxxxxxxxxxxxx
-.youtube.com	TRUE	/	TRUE	1798765432	SAPISID	xxxxxxxxxxxxx
-.google.com	TRUE	/	TRUE	1798765432	__Secure-3PAPISID	xxxxxxxxxxxxx
-.google.com	TRUE	/	TRUE	1798765432	__Secure-3PSID	xxxxxxxxxxxxx
-```
-
-### 字段说明
-
-每行 7 个字段（用 **TAB 键** 分隔）：
-
-| 序号 | 字段 | 说明 | 示例 |
-|------|------|------|------|
-| 1 | domain | Cookie 所属域名 | `.youtube.com` |
-| 2 | flag | 是否所有子域名匹配 | `TRUE` |
-| 3 | path | Cookie 路径 | `/` |
-| 4 | secure | 是否仅 HTTPS | `TRUE` |
-| 5 | expiration | 过期时间（UNIX 秒） | `1798765432` |
-| 6 | name | Cookie 名称 | `LOGIN_INFO` |
-| 7 | value | Cookie 值 | `xxxxx` |
-
-### 🔧 如何获取 Cookies 文件？
-
-#### 方法 A：浏览器扩展（最简单 ⭐）
-
-1. **Chrome / Edge**：
-   - 安装扩展 [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
-   - 打开 [music.youtube.com](https://music.youtube.com) 并登录
-   - 点击扩展图标 → 点击 **Export** → 保存为 `.txt` 文件
-
-2. **Firefox**：
-   - 安装扩展 [cookies.txt](https://addons.mozilla.org/firefox/addon/cookies-txt/)
-   - 同样访问 music.youtube.com → 导出
-
-#### 方法 B：开发者工具手动导出
-
-1. 打开 Chrome/Edge，访问 [music.youtube.com](https://music.youtube.com) 并登录
-2. 按 **F12** 打开开发者工具
-3. 切换到 **Application**（应用程序）标签
-4. 左侧找到 **Cookies** → 点击 `https://music.youtube.com`
-5. 记录以下 Cookie 的 **Name** 和 **Value**：
-
-   | 必需的 Cookie | 用途 |
-   |---------------|------|
-   | `CONSENT` | 同意状态 |
-   | `VISITOR_INFO1_LIVE` | 访客标识 |
-   | `LOGIN_INFO` | 登录信息 |
-   | `SID` | 会话 ID |
-   | `HSID` | 安全会话 |
-   | `SSID` | 安全会话 |
-   | `APISID` | API 会话 |
-   | `SAPISID` | 安全 API 会话 |
-   | `__Secure-3PAPISID` | Google 账户 |
-   | `__Secure-3PSID` | Google 账户 |
-
-6. 还需要从 `https://accounts.google.com` 的 Cookies 中获取 `__Secure-3PAPISID` 和 `__Secure-3PSID`
-
-7. 按上面的 Netscape 格式将 Cookie 写入 `.txt` 文件：
-   ```
-   .youtube.com	TRUE	/	TRUE	1798765432	CONSENT	YES+
-   .youtube.com	TRUE	/	FALSE	1798765432	VISITOR_INFO1_LIVE	你的值
-   ... (以此类推)
-   ```
-
-> ⚠ **重要**：Cookies 包含您的账号敏感信息，请勿分享给他人！
-
----
-
-## ❓ 常见问题
-
-### Q: 下载速度慢怎么办？
-- 降低并发数（设置 → 并发数 → 1-2）
-- YouTube 可能对高频请求限流，降低并发可缓解
-
-### Q: 下载失败 / 403 错误？
-- 尝试降低并发数
-- 检查网络连接
-- 如果持续失败，尝试重新登录（账号 → 登出 → 重新登录）
-
-### Q: OAuth 浏览器没有自动打开？
-- 手动打开浏览器访问 YouTube Music，确保能正常登录
-- 尝试使用「导入 Cookies」替代方案
-- 检查默认浏览器设置
-
-### Q: 封面图片没有写入？
-- 确保下载时网络正常（封面从 YouTube 服务器获取）
-- 封面写入仅支持 `.m4a` 格式
-
-### Q: 能在没有 Python 的电脑上运行吗？
-- 可以！使用 PyInstaller 打包为 `.exe`：
-  ```bash
-  pyinstaller YtMusicVault.spec
-  ```
-- 但注意 `yt-dlp.exe` 也需要在目标电脑的 PATH 中，或随程序一起打包
-
-### Q: 下载的文件在哪里？
-- 默认位置：`C:\Users\<用户名>\Music\YtMusicVault\`
-- 可在 设置 → 下载目录 中自定义
-
-### Q: 如何更新 yt-dlp？
-```bash
-pip install --upgrade yt-dlp
-```
-
----
-
-## 📁 项目文件结构
-
-```
-YTMDownloader/
-├── main.py                    # 程序入口
-├── GUIDE.md                   # 本文件（使用指南）
-├── README.md                  # 项目说明
-├── requirements.txt           # Python 依赖
-├── YtMusicVault.spec          # PyInstaller 打包配置
-└── ytmusicvault/              # 源代码
-    ├── core/                  # 核心逻辑
-    │   ├── auth.py            # 认证模块
-    │   ├── ytm_client.py      # YouTube Music API
-    │   ├── downloader.py      # 下载引擎
-    │   ├── metadata.py        # 元数据写入
-    │   ├── queue_manager.py   # 队列管理
-    │   └── database.py        # 本地数据库
-    └── ui/                    # 用户界面
-        ├── main_window.py     # 主窗口
-        ├── sidebar.py         # 侧边栏
-        ├── song_list.py       # 歌曲列表
-        └── settings_dialog.py # 设置对话框
-```
+回归测试使用合成凭据和模拟响应；启动测试不读取真实账号、不发起下载。真实账号验收需要您在本机完成登录并核对私有 / 收藏歌单及长歌单内容。

@@ -54,6 +54,10 @@ class Song:
     thumbnail: str = ""           # 封面缩略图 URL（最高分辨率）
     track_number: int = 0         # 在专辑中的曲目编号
     year: int = 0                 # 发行年份
+    download_video_id: str = ""    # MV 对应视频；video_id 保留为歌单条目 ID
+    download_mode: str = "audio"
+    audio_format: str = "mp3"       # 音频后处理格式：flac / mp3（历史配置兼容 m4a）
+    stage: str = ""                 # 供下载管理页显示的当前处理阶段
 
     # ═══════════════════════════════════════════════════════
     # 运行时状态（下载过程中动态更新，跨线程共享）
@@ -104,7 +108,7 @@ class Song:
 def _sanitize(name: str) -> str:
     """移除文件名中的非法字符。
     
-    Windows/Mac/Linux 共同禁止的字符：< > : " / \ | ? *
+    Windows/Mac/Linux 共同禁止的字符：< > : " / \\ | ? *
     这些字符在文件名中出现会导致文件创建失败。
     
     Args:

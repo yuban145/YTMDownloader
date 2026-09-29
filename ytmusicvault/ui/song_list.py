@@ -16,10 +16,11 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QCheckBox, QPushButton, QLineEdit, QLabel,
-    QAbstractItemView,
+    QAbstractItemView, QMenu,
 )
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QColor
+from pathlib import Path
 
 from ..models.song import Song, DownloadStatus
 
@@ -33,7 +34,10 @@ class SongListWidget(QWidget):
     """
 
     download_clicked = Signal(list)  # list[Song]
+    playlist_download_clicked = Signal()
     selection_changed = Signal(int, int)  # selected_count, total
+    open_local_requested = Signal(str)
+    open_source_requested = Signal(str)
 
     def __init__(self, parent=None):
         """初始化歌曲列表。"""
@@ -82,6 +86,8 @@ class SongListWidget(QWidget):
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)  # 隐藏行号
         self._table.setShowGrid(False)  # 隐藏网格线
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._context_menu)
 
         # 列宽策略
         header = self._table.horizontalHeader()
@@ -118,6 +124,11 @@ class SongListWidget(QWidget):
         self._download_btn.setEnabled(False)  # 初始禁用（未勾选任何歌曲）
         bottom.addWidget(self._download_btn)
 
+        self._download_playlist_btn = QPushButton("下载整个歌单")
+        self._download_playlist_btn.clicked.connect(self._on_download_playlist_clicked)
+        self._download_playlist_btn.setEnabled(False)
+        bottom.addWidget(self._download_playlist_btn)
+
         layout.addLayout(bottom)
 
     # ── 公共 API ──────────────────────────────────────
@@ -129,7 +140,9 @@ class SongListWidget(QWidget):
             songs: Song 对象列表
         """
         self._songs = songs
-        self._apply_filter()
+        self._apply_filter(self._search_input.text())
+        self._download_playlist_btn.setEnabled(bool(songs))
+        self._download_playlist_btn.setText(f"下载整个歌单 ({len(songs)})")
 
     def update_song_status(self, song: Song):
         """更新单首歌曲的显示状态（下载进度/完成/失败）。
@@ -235,6 +248,7 @@ class SongListWidget(QWidget):
 
         # ── 列 4：状态 ────────────────────────────────
         self._set_status_cell(row, song.status)
+        self._table.item(row, 4).setToolTip(song.error_msg)
 
         # 行高统一为 36px
         self._table.setRowHeight(row, 36)
@@ -271,9 +285,9 @@ class SongListWidget(QWidget):
         for row, s in enumerate(self._filtered_songs):
             if s.video_id == song.video_id:
                 self._set_status_cell(row, song.status)
+                self._table.item(row, 4).setToolTip(song.error_msg)
                 # Also update local reference
                 self._filtered_songs[row] = song
-                break
 
     def _update_info(self):
         """Update info label and download button."""
@@ -297,7 +311,9 @@ class SongListWidget(QWidget):
 
     def _select_all(self, checked: bool):
         for cb in self._checkboxes.values():
+            cb.blockSignals(True)
             cb.setChecked(checked)
+            cb.blockSignals(False)
         self._update_info()
 
     def _deselect_all(self):
@@ -315,3 +331,22 @@ class SongListWidget(QWidget):
         selected = self.get_selected_songs()
         if selected:
             self.download_clicked.emit(selected)
+
+    def _on_download_playlist_clicked(self):
+        if self._songs:
+            self.playlist_download_clicked.emit()
+
+    def _context_menu(self, pos):
+        row = self._table.rowAt(pos.y())
+        if row < 0 or row >= len(self._filtered_songs):
+            return
+        song = self._filtered_songs[row]
+        menu = QMenu(self)
+        local = menu.addAction("打开本地文件")
+        local.setEnabled(bool(song.file_path and Path(song.file_path).is_file()))
+        source = menu.addAction("打开源页面")
+        selected = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if selected is local:
+            self.open_local_requested.emit(song.file_path)
+        elif selected is source:
+            self.open_source_requested.emit(song.video_id)

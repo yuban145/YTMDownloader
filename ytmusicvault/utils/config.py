@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 
 @dataclass
@@ -27,16 +28,20 @@ class AppConfig:
     # ── 认证 ────────────────────────────────────────────
     oauth_token: str = ""              # （保留字段，当前使用 Cookies 认证）
     cookies_path: str = ""             # 自定义 cookies.txt 路径
+    browser_cookie_source: str = "none" # auto/edge/chrome/firefox/brave/vivaldi/opera/none
 
     # ── 下载设置 ────────────────────────────────────────
     download_dir: str = str(Path.home() / "Music" / "YtMusicVault")  # 默认下载目录
-    audio_quality: str = "256"         # 音质：128, 256, best
+    audio_quality: str = "best"        # MP3 转码码率设置；best 为最佳可用质量
+    download_mode: str = "video"       # video: 最高画质 MV / audio: 单独音频
+    audio_format: str = "mp3"          # flac / mp3；旧配置仍可使用 m4a
     concurrent_downloads: int = 4      # 最大同时下载数
     max_retries: int = 3               # 失败重试次数
     retry_delay: int = 5               # 重试间隔（秒）
 
     # ── 代理设置（防火墙后用户） ────────────────────────
     proxy_enabled: bool = False        # 是否启用代理
+    proxy_mode: str = "system"         # system / manual / direct
     proxy_type: str = "http"           # 代理类型：http, socks5
     proxy_host: str = "127.0.0.1"      # 代理主机
     proxy_port: int = 1080             # 代理端口
@@ -55,18 +60,23 @@ class AppConfig:
     _config_path: str = field(default="", repr=False)
 
     @property
-    def proxy_url(self) -> str:
-        """构建完整的代理 URL（供 yt-dlp --proxy 和 requests proxies 使用）。
+    def proxy_url(self) -> Optional[str]:
+        """构建完整的代理 URL（供 yt-dlp 和 requests 使用）。
 
         格式：{type}://[username:password@]host:port
-        未启用代理时返回空字符串。
+        system 返回 None，direct 返回空字符串。
         """
-        if not self.proxy_enabled:
+        if self.proxy_mode == "system":
+            return None  # requests / yt-dlp inherit environment + Windows proxy settings
+        if self.proxy_mode == "direct":
             return ""
         auth = ""
         if self.proxy_username:
-            auth = f"{self.proxy_username}:{self.proxy_password}@"
-        return f"{self.proxy_type}://{auth}{self.proxy_host}:{self.proxy_port}"
+            auth = f"{quote(self.proxy_username, safe='')}:{quote(self.proxy_password, safe='')}@"
+        host = self.proxy_host.strip()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{self.proxy_type}://{auth}{host}:{self.proxy_port}"
 
     def save(self) -> None:
         """将当前配置序列化为 JSON 并保存到磁盘。
@@ -79,12 +89,16 @@ class AppConfig:
         data = {
             "oauth_token": self.oauth_token,
             "cookies_path": self.cookies_path,
+            "browser_cookie_source": self.browser_cookie_source,
             "download_dir": self.download_dir,
             "audio_quality": self.audio_quality,
+            "download_mode": self.download_mode,
+            "audio_format": self.audio_format,
             "concurrent_downloads": self.concurrent_downloads,
             "max_retries": self.max_retries,
             "retry_delay": self.retry_delay,
             "proxy_enabled": self.proxy_enabled,
+            "proxy_mode": self.proxy_mode,
             "proxy_type": self.proxy_type,
             "proxy_host": self.proxy_host,
             "proxy_port": self.proxy_port,
@@ -122,9 +136,17 @@ class AppConfig:
                     data = json.load(f)
                 # 动态赋值：只设置 dataclass 中存在的字段
                 for key, value in data.items():
-                    if hasattr(config, key):
+                    if key in cls.__dataclass_fields__ and not key.startswith("_"):
                         setattr(config, key, value)
-            except (json.JSONDecodeError, OSError):
+                if "proxy_mode" not in data:
+                    config.proxy_mode = "manual" if data.get("proxy_enabled") else "system"
+                if config.proxy_mode not in ("system", "manual", "direct"):
+                    config.proxy_mode = "system"
+                if config.download_mode not in ("video", "audio"):
+                    config.download_mode = "video"
+                if config.audio_format not in ("flac", "mp3", "m4a"):
+                    config.audio_format = "mp3"
+            except (json.JSONDecodeError, OSError, AttributeError):
                 # 配置文件损坏 → 静默使用默认配置，不阻塞启动
                 pass
         return config

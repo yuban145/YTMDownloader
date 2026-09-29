@@ -1,712 +1,533 @@
-"""主窗口 — 应用的核心控制器，编排所有 UI 和业务逻辑。
-
-职责（MVC 中的 Controller 角色）：
-  1. 持有所有核心组件引用（config, db, auth, ytm_client, downloader, queue）
-  2. 连接 UI 信号到业务逻辑（Sidebar 选择 → 加载歌曲 → 展示）
-  3. 管理登录流程（自动登录 / 内嵌浏览器登录 / Cookies 导入导出）
-  4. 编排下载流程（创建 Downloader → QueueManager → 后台线程）
-  5. 跨线程状态同步（下载线程 → Signal → 主线程 UI 更新）
-
-⚠️ 启动死锁风险分析：
-  - QTimer.singleShot(100ms, _auto_login)：延迟到事件循环运行后才执行，
-    避免在 QApplication.exec() 之前发起网络请求
-  - _load_library() 在**主线程**同步执行 HTTP 请求 → 大量歌曲时会 UI 冻结
-    建议：将 _load_library 移到后台线程
-  - closeEvent 未取消下载 → 线程写已关闭的 DB 连接会崩溃
-    建议：在 closeEvent 中调用 self._queue.cancel()
-"""
-
+"""Application shell. All network work belongs to background controllers."""
+from dataclasses import replace
+from pathlib import Path
 import os
-import threading
-from typing import Optional
-
-from PySide6.QtWidgets import (
-    QMainWindow, QSplitter, QStatusBar, QMenuBar, QMenu,
-    QMessageBox, QLabel, QProgressBar, QWidget, QHBoxLayout,
-    QVBoxLayout, QFileDialog, QApplication,
-)
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
-from PySide6.QtNetwork import QNetworkProxy
-
+from urllib.parse import quote
+from PySide6.QtCore import QTimer, Qt, QUrl, QSignalBlocker
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QSplitter, QProgressBar, QMessageBox, QInputDialog, QComboBox, QTabWidget)
+from .styles import DARK_THEME
 from .sidebar import Sidebar
 from .song_list import SongListWidget
-from .styles import DARK_THEME
-
-from ..models.song import Song, DownloadStatus
-from ..models.playlist import Playlist
+from .login_dialog import LoginDialog
+from .settings_dialog import SettingsDialog
+from .library_controller import LibraryController
+from .download_controller import DownloadController
+from .download_page import DownloadPage
 from ..core.auth import AuthManager
-from ..core.ytm_client import YtmClient
-from ..core.downloader import Downloader
-from ..core.metadata import MetadataWriter
-from ..core.queue_manager import QueueManager
-from ..core.database import Database
+from ..core.accounts import AccountStore
+from ..core.database import Database, media_type_for_download
+from ..core.ytm_client import parse_playlist_id, ServiceError
+from ..models.playlist import Playlist
+from ..models.song import DownloadStatus
 from ..utils.config import AppConfig
+from ..utils.helpers import safe_filename
+from ..utils.proxy import proxy_description
 
 
 class MainWindow(QMainWindow):
-    """YtMusicVault 主窗口 — 应用的中枢控制器。
-
-    线程模型：
-      - 主线程：Qt 事件循环 + UI 更新
-      - 下载线程：QueueManager.start() 所在的后台线程
-      - Worker 线程：ThreadPoolExecutor 中的 _download_worker
-      - 跨线程通信：PySide6 Signal/Slot（自动排队到主线程）
-
-    持有组件：
-      Core:  config, db, auth, ytm_client, downloader, metadata, queue
-      UI:    sidebar, song_list, status_bar
-    """
-
-    # ═══════════════════════════════════════════════════════
-    # 信号定义（类属性）
-    # PySide6 Signal 是线程安全的 — 可以从任何线程 emit，
-    # slot 自动在主线程（接收者所在线程）执行。
-    # ═══════════════════════════════════════════════════════
-    status_updated = Signal(Song)                       # 单曲状态变更
-    progress_updated = Signal(str, float, str, str)     # video_id, percent, speed, eta
-
-    def __init__(self):
-        """初始化主窗口 — 加载配置 → 创建数据库 → 构建 UI → 尝试自动登录。
-
-        初始化顺序有严格要求：UI 组件创建必须在核心组件之后，
-        因为 UI 回调可能立即访问 config/db/auth。
-        """
+    def __init__(self, config=None, auth=None, db=None, auto_restore=True):
         super().__init__()
-
-        # ── 核心组件初始化 ────────────────────────────
-        # 顺序：config → db → auth（后两者依赖 config 中的路径）
-        self._config = AppConfig.load()       # 从磁盘加载用户偏好
-        self._db = Database()                 # SQLite 连接 + 建表
-        self._auth = AuthManager()            # Cookie 凭据管理
-        self._ytm: Optional[YtmClient] = None       # 登录后才创建
-        self._downloader: Optional[Downloader] = None # 下载时才创建
-        self._metadata = MetadataWriter()     # 元数据写入器（无状态）
-        self._queue: Optional[QueueManager] = None   # 下载时才创建
-
-        # ── State ──────────────────────────────────────
-        self._current_playlist_id: Optional[str] = None
-        self._songs: list[Song] = []
-        self._playlists: list[Playlist] = []
-        self._downloading = False
-        self._login_window = None
-
-        # ── UI setup ───────────────────────────────────
+        self._config = config or AppConfig.load()
+        self._auth = auth or AuthManager()
+        self._accounts = AccountStore(self._auth.directory)
+        self._active_account_id = self._accounts.active_id or "default"
+        if self._active_account_id != "default":
+            self._auth = self._accounts.auth_for(self._active_account_id)
+        self._db = db or Database()
+        self.library = LibraryController(self._auth, self)
+        self._download_log_path = self._accounts.root / "logs" / "download.log"
+        self.downloads = DownloadController(self._db, self, log_path=self._download_log_path)
+        self._songs, self._playlists = [], []
+        self._current_playlist_id, self._current_title = "LM", "我喜欢"
+        self._login_dialog = None
+        self._login_target = None
+        self._pending_account_label = ""
+        self._closing = False
+        self._account_name = ""
+        self._account_verified = False
+        self._account_identity_available = False
+        self._errors = {}
+        self._summary = "请登录以获取个人音乐库。"
+        self._batch_done = set()
         self._setup_ui()
-        self._connect_signals()
-        self._apply_theme()
-
-        # Restore window size
-        self.resize(self._config.window_width, self._config.window_height)
-
-        # Auto-login attempt
-        QTimer.singleShot(100, self._auto_login)
-
-    # ═══════════════════════════════════════════════════════
-    #  UI Setup
-    # ═══════════════════════════════════════════════════════
+        self.library.signed_out.connect(self._signed_out)
+        self.library.account_changed.connect(self._account_ready)
+        self.library.playlists_loaded.connect(self._playlists_ready)
+        self.library.tracks_loaded.connect(self._tracks_ready)
+        self.library.error.connect(self._error)
+        self.library.busy_changed.connect(self._busy)
+        self.downloads.updated.connect(self._download_updated)
+        self.downloads.finished.connect(self._download_finished)
+        self.downloads.log_entry.connect(self._download_page.append_log)
+        self._download_page.load_log_file()
+        self._download_page.set_history(self._db.get_all_records())
+        self._signed_out()
+        if auto_restore:
+            QTimer.singleShot(0, lambda: self.library.restore(self._config.proxy_url))
 
     def _setup_ui(self):
-        """Build the main window layout."""
-        self.setWindowTitle("YtMusicVault — YouTube Music 下载器")
-        self.setMinimumSize(900, 600)
-
-        # ── Menu bar ───────────────────────────────────
-        menubar = self.menuBar()
-
-        # Account menu
-        account_menu = menubar.addMenu("账号(&A)")
-        account_menu.addAction("🔐 登录 YouTube Music", self._login_with_browser)
-        account_menu.addAction("🔄 刷新音乐库 (F5)", self._refresh_library, "F5")
-        account_menu.addSeparator()
-        account_menu.addAction("📂 导入 Cookies 文件", self._import_cookies)
-        account_menu.addAction("📤 导出 Cookies 文件", self._export_cookies)
-        account_menu.addSeparator()
-        account_menu.addAction("登出", self._logout)
-
-        # Settings menu
-        settings_menu = menubar.addMenu("设置(&S)")
-        settings_menu.addAction("偏好设置...", self._open_settings)
-
-        # Help menu
-        help_menu = menubar.addMenu("帮助(&H)")
-        help_menu.addAction("使用指南", self._open_guide)
-        help_menu.addSeparator()
-        help_menu.addAction("关于", self._show_about)
-
-        # ── Central widget ─────────────────────────────
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-
-        # Splitter: sidebar | content
-        self._splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        # Sidebar
-        self._sidebar = Sidebar()
-        self._splitter.addWidget(self._sidebar)
-
-        # Right side: song list
-        self._song_list = SongListWidget()
-        self._splitter.addWidget(self._song_list)
-
-        self._splitter.setStretchFactor(0, 0)
-        self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([220, 780])
-        main_layout.addWidget(self._splitter)
-
-        # ── Status bar ─────────────────────────────────
-        self._status_bar = QStatusBar()
-        self.setStatusBar(self._status_bar)
-
-        # Status bar widgets
-        self._login_status = QLabel("🔒 未登录")
-        self._status_bar.addWidget(self._login_status)
-
-        self._status_bar.addWidget(QLabel("  "), 1)
-
-        # Overall progress bar
-        self._overall_progress = QProgressBar()
-        self._overall_progress.setMaximumWidth(250)
-        self._overall_progress.setMaximumHeight(14)
-        self._overall_progress.setVisible(False)
-        self._status_bar.addPermanentWidget(self._overall_progress)
-
-        self._speed_label = QLabel("")
-        self._status_bar.addPermanentWidget(self._speed_label)
-
-        self._count_label = QLabel("")
-        self._status_bar.addPermanentWidget(self._count_label)
-
-    def _connect_signals(self):
-        """Wire up signals and slots."""
-        # Sidebar playlist selection
-        self._sidebar.liked_selected.connect(self._on_liked_selected)
-        self._sidebar.playlist_selected.connect(self._on_playlist_selected)
-
-        # Download button
-        self._song_list.download_clicked.connect(self._on_download_clicked)
-
-        # Cross-thread status updates
-        self.status_updated.connect(self._on_status_updated)
-        self.progress_updated.connect(self._on_progress_updated)
-
-    def _apply_theme(self):
-        """Apply dark theme stylesheet."""
+        self.setWindowTitle("YtMusicVault — YouTube Music 音乐库")
+        self.resize(self._config.window_width, self._config.window_height)
+        self.setMinimumSize(960, 650)
         self.setStyleSheet(DARK_THEME)
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        self.setCentralWidget(central)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("账号"))
+        self._account_combo = QComboBox()
+        self._account_combo.setMinimumWidth(140)
+        self._refresh_account_choices()
+        self._account_combo.currentIndexChanged.connect(self._switch_account)
+        toolbar.addWidget(self._account_combo)
+        self._login_button = QPushButton("添加账号")
+        self._login_button.clicked.connect(lambda: self._login(new=True))
+        self._relogin_button = QPushButton("重新登录")
+        self._relogin_button.clicked.connect(lambda: self._login(new=False))
+        self._refresh_button = QPushButton("刷新音乐库")
+        self._refresh_button.clicked.connect(self._refresh_library)
+        self._open_button = QPushButton("打开歌单链接")
+        self._open_button.clicked.connect(self._open_playlist)
+        settings = QPushButton("设置")
+        settings.clicked.connect(self._settings)
+        self._logout_button = QPushButton("退出登录")
+        self._logout_button.clicked.connect(self._logout)
+        for button in (self._login_button, self._relogin_button, self._refresh_button,
+                       self._open_button, settings, self._logout_button):
+            toolbar.addWidget(button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+        self._login_status = QLabel("未登录")
+        layout.addWidget(self._login_status)
+        media_row = QHBoxLayout()
+        media_row.addWidget(QLabel("下载模式"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("MV · 最高画质（MKV，无损合并）", "video")
+        self._mode_combo.addItem("单独音频 · FLAC", "audio_flac")
+        self._mode_combo.addItem("单独音频 · MP3", "audio_mp3")
+        selected_mode = ("video" if self._config.download_mode == "video" else
+                         f"audio_{self._config.audio_format}" if self._config.audio_format in ("flac", "mp3") else "audio_mp3")
+        self._mode_combo.setCurrentIndex(max(0, self._mode_combo.findData(selected_mode)))
+        self._mode_combo.currentIndexChanged.connect(self._mode_changed)
+        media_row.addWidget(self._mode_combo)
+        self._proxy_label = QLabel(proxy_description(self._config.proxy_url))
+        self._proxy_label.setWordWrap(True)
+        media_row.addWidget(self._proxy_label, 1)
+        layout.addLayout(media_row)
+        notice = QHBoxLayout()
+        self._message = QLabel("请登录以获取个人音乐库。")
+        self._message.setWordWrap(True)
+        notice.addWidget(self._message, 1)
+        self._retry_button = QPushButton("重试加载")
+        self._retry_button.clicked.connect(self._refresh_library)
+        notice.addWidget(self._retry_button)
+        layout.addLayout(notice)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._sidebar = Sidebar()
+        self._song_list = SongListWidget()
+        splitter.addWidget(self._sidebar)
+        splitter.addWidget(self._song_list)
+        splitter.setSizes([260, 800])
+        self._download_page = DownloadPage(log_path=self._download_log_path)
+        self._pages = QTabWidget()
+        self._pages.addTab(splitter, "音乐库")
+        self._pages.addTab(self._download_page, "下载")
+        layout.addWidget(self._pages, 1)
+        self._sidebar.liked_selected.connect(lambda: self._select("LM", "我喜欢"))
+        self._sidebar.playlist_selected.connect(self._select)
+        self._song_list.download_clicked.connect(self._download)
+        self._song_list.playlist_download_clicked.connect(self._download_playlist)
+        self._song_list.open_local_requested.connect(self._open_local_file)
+        self._song_list.open_source_requested.connect(self._open_source_page)
+        self._download_page.cancel_requested.connect(self.downloads.cancel)
+        self._download_page.retry_requested.connect(self._retry_download)
+        self._download_page.refresh_requested.connect(
+            lambda: self._download_page.set_history(self._db.get_all_records()))
+        self._download_page.open_local_requested.connect(self._open_local_file)
+        self._download_page.open_source_requested.connect(self._open_source_page)
+        self._download_page.open_log_requested.connect(self._open_log_file)
+        bottom = QHBoxLayout()
+        self._download_label = QLabel("")
+        bottom.addWidget(self._download_label, 1)
+        self._progress = QProgressBar()
+        self._progress.hide()
+        bottom.addWidget(self._progress)
+        cancel = QPushButton("取消下载")
+        cancel.clicked.connect(self.downloads.cancel)
+        bottom.addWidget(cancel)
+        layout.addLayout(bottom)
 
-    # ═══════════════════════════════════════════════════════
-    #  Proxy
-    # ═══════════════════════════════════════════════════════
+    def _refresh_account_choices(self):
+        with QSignalBlocker(self._account_combo):
+            self._account_combo.clear()
+            self._account_combo.addItem("选择已保存账号", "")
+            for account_id, label in self._accounts.items():
+                self._account_combo.addItem(label, account_id)
+            self._account_combo.setCurrentIndex(max(0, self._account_combo.findData(self._active_account_id)))
 
-    def _apply_webengine_proxy(self):
-        """Apply proxy settings to QtWebEngine (for login browser)."""
-        if not self._config.proxy_enabled:
+    def _switch_account(self, *_):
+        account_id = self._account_combo.currentData()
+        if not account_id:
+            self._refresh_account_choices()
             return
-        proxy_url = self._config.proxy_url
-        if not proxy_url:
+        if account_id == self._active_account_id:
             return
-
-        # QWebEngine reads proxy from command-line or environment
-        # We set via QNetworkProxy for the application
-        from PySide6.QtNetwork import QNetworkProxy
-        proxy = QNetworkProxy()
-        if self._config.proxy_type == "socks5":
-            proxy.setType(QNetworkProxy.ProxyType.Socks5Proxy)
-        else:
-            proxy.setType(QNetworkProxy.ProxyType.HttpProxy)
-        proxy.setHostName(self._config.proxy_host)
-        proxy.setPort(self._config.proxy_port)
-        if self._config.proxy_username:
-            proxy.setUser(self._config.proxy_username)
-            proxy.setPassword(self._config.proxy_password)
-        QNetworkProxy.setApplicationProxy(proxy)
-
-    # ═══════════════════════════════════════════════════════
-    #  Auth
-    # ═══════════════════════════════════════════════════════
-
-    def _auto_login(self):
-        """Try to auto-login from saved credentials."""
-        # Apply proxy before any network access
-        self._apply_webengine_proxy()
-
-        ytm = self._auth.login(proxy_url=self._config.proxy_url)
-        if ytm:
-            self._ytm = YtmClient(ytm)
-            self._login_status.setText("✅ 已登录（Cookies 已加载）")
-            self._login_status.setStyleSheet("color: #a6e3a1;")
-            self._load_library()
-        else:
-            self._login_status.setText("🔒 未登录 — 请登录账号")
-            self._login_status.setStyleSheet("color: #f38ba8;")
-
-    def _login_with_browser(self):
-        """Open embedded browser to music.youtube.com, let user log in,
-        extract cookies automatically. Works entirely in-app, no OAuth needed."""
-        from .login_browser import LoginBrowserWidget
-
-        # Set proxy for QWebEngine before opening browser
-        self._apply_webengine_proxy()
-
-        # Close previous login window if still open
-        if self._login_window is not None:
-            try:
-                self._login_window.close()
-            except RuntimeError:
-                pass
-            self._login_window = None
-            self._login_browser = None
-
-        self._login_window = QWidget(None, Qt.WindowType.Window)
-        self._login_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self._login_window.setWindowTitle("YtMusicVault — 登录 YouTube Music")
-        self._login_window.resize(800, 650)
-        self._login_window.setMinimumSize(700, 500)
-
-        # Clean up references when user closes via X
-        self._login_window.destroyed.connect(self._on_login_window_closed)
-
-        layout = QVBoxLayout(self._login_window)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        self._login_browser = LoginBrowserWidget(self._auth.cookies_path)
-        self._login_browser.login_success.connect(self._on_login_browser_success)
-        self._login_browser.login_failed.connect(self._on_login_browser_failed)
-
-        layout.addWidget(self._login_browser)
-        self._login_window.setStyleSheet(DARK_THEME)
-        self._login_window.show()
-
-    def _on_login_window_closed(self):
-        """User closed the login window manually (via X button)."""
-        self._login_window = None
-        self._login_browser = None
-
-    def _on_login_browser_success(self):
-        """Cookies extracted successfully."""
-        if self._login_window:
-            self._login_window.close()
-            self._login_window = None
-            self._login_browser = None
-
-        self._login_status.setText("✅ Cookies 已保存（下次启动自动登录），正在加载音乐库...")
-        self._login_status.setStyleSheet("color: #f9e2af;")
-        self._auto_login()
-
-    def _on_login_browser_failed(self, error_msg: str):
-        """Login browser failed."""
-        if self._login_window:
-            self._login_window.close()
-            self._login_window = None
-            self._login_browser = None
-
-        QMessageBox.critical(self, "登录失败", error_msg)
-        self._login_status.setText("🔒 未登录 — 请登录账号")
-        self._login_status.setStyleSheet("color: #f38ba8;")
-
-    def _import_cookies(self):
-        """Import cookies from a file (Netscape format)."""
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择 Cookies 文件（Netscape 格式 .txt）",
-            "",
-            "Cookies 文件 (*.txt);;所有文件 (*)",
-        )
-        if not path:
+        if self.downloads.running:
+            QMessageBox.information(self, "下载进行中", "请等待当前下载完成或取消后切换账号。")
+            self._refresh_account_choices()
             return
-
-        # Simple import: copy file to standard location
+        self._active_account_id = account_id
+        self._pending_account_label = ""
+        self.library.auth = self._accounts.auth_for(account_id)
         try:
-            import shutil
-            shutil.copy2(path, self._auth.cookies_path)
-            QMessageBox.information(self, "导入成功", "Cookies 文件已导入！")
-            self._login_status.setText("⏳ 正在验证登录...")
-            self._login_status.setStyleSheet("color: #f9e2af;")
-            self._auto_login()
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "导入失败",
-                f"无法复制 Cookies 文件：{str(e)}\n\n"
-                "💡 推荐使用内嵌浏览器直接登录，或\n"
-                "使用浏览器扩展 'Get cookies.txt LOCALLY' 导出。"
-            )
+            self._accounts.activate(account_id)
+        except OSError:
+            self._error("storage", "无法保存当前账号选择；本次仍会尝试切换。")
+        self.library.restore(self._config.proxy_url)
+
+    def _login(self, new=False):
+        if self.downloads.running:
+            QMessageBox.information(self, "下载进行中", "请等待当前下载完成或取消下载后切换账号。")
+            return
+        if self._login_dialog:
+            self._login_dialog.show()
+            self._login_dialog.raise_()
+            return
+        if new:
+            default_name = f"账号 {len(self._accounts.items()) + 1}"
+            label, accepted = QInputDialog.getText(self, "添加账号", "为账号取一个便于识别的名称：",
+                                                    text=default_name)
+            if not accepted or not label.strip():
+                return
+            account_id = ("default" if not self._accounts.items() and
+                          not self._accounts.auth_for("default").has_saved_session
+                          else self._accounts.new_id())
+            self._login_target = (account_id, label.strip())
+        else:
+            account_id = self._active_account_id or "default"
+            label = self._accounts.label(account_id) or self._pending_account_label or "当前账号"
+            self._login_target = (account_id, label)
+        self._login_dialog = LoginDialog(self)
+        self._login_dialog.remember.setChecked(new)
+        self._login_dialog.submitted.connect(self._submit_login)
+        self._login_dialog.finished.connect(self._login_dialog_closed)
+        self._login_dialog.show()
+
+    def _submit_login(self, request):
+        account_id, label = self._login_target
+        self._active_account_id = account_id
+        self._pending_account_label = label
+        self.library.auth = self._accounts.auth_for(account_id)
+        self.library.login(request, self._config.proxy_url)
+
+    def _login_dialog_closed(self, *_):
+        self._login_dialog = None
+        self._login_target = None
+
+    def _sync_saved_account(self):
+        account_id = self._active_account_id
+        if not self.library.client or not account_id:
+            return
+        if self.library.auth.has_saved_session:
+            label = (self._account_name if self._account_identity_available and self._account_name and
+                     self._account_name != "账号未验证" else
+                     self._pending_account_label or self._accounts.label(account_id) or "当前账号")
+            try:
+                self._accounts.register(account_id, label)
+            except OSError:
+                self._error("storage", "音乐库已连接，但无法保存账号列表。")
+                return
+            self._pending_account_label = ""
+        elif self._accounts.label(account_id):
+            try:
+                self._accounts.forget(account_id)
+            except OSError:
+                self._error("storage", "无法更新账号列表。")
+        self._refresh_account_choices()
+
+    def _account_ready(self, account):
+        self._account_name = account["accountName"]
+        self._account_verified = account.get("verified", True)
+        self._account_identity_available = account.get(
+            "identityAvailable", self._account_verified and self._account_name != "账号未验证")
+        handle = account.get("channelHandle") or ""
+        alias = self._pending_account_label or self._accounts.label(self._active_account_id)
+        identity_text = f"Google 账号：{self._account_name} {handle}" if self._account_identity_available else "账号身份未验证"
+        self._login_status.setText(f"{alias} · {identity_text}" if alias else identity_text)
+        if self._login_dialog:
+            self._login_dialog.headers.clear()
+            self._login_dialog.accept()
+        for button in (self._refresh_button, self._open_button, self._logout_button):
+            button.setEnabled(True)
+        self._sidebar.setEnabled(True)
+        self._refresh_library()
+        if self._account_verified:
+            QTimer.singleShot(0, self._sync_saved_account)
+
+    def _signed_out(self):
+        self._errors.clear()
+        self._summary = "请登录以获取个人音乐库。"
+        self._account_name = ""
+        self._account_verified = False
+        self._account_identity_available = False
+        self._login_status.setText("未登录")
+        self._songs, self._playlists = [], []
+        self._current_playlist_id, self._current_title = "LM", "我喜欢"
+        self._sidebar.set_playlists([])
+        self._sidebar.setEnabled(False)
+        self._song_list.set_songs([])
+        self._song_list.setEnabled(False)
+        self._retry_button.hide()
+        self._message.setText("请登录以获取个人音乐库。")
+        for button in (self._refresh_button, self._open_button, self._logout_button):
+            button.setEnabled(False)
 
     def _logout(self):
-        """Clear credentials and reset state."""
-        reply = QMessageBox.question(
-            self,
-            "确认登出",
-            "确定要登出吗？将清除本地保存的登录凭据。",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        if self.downloads.running:
+            QMessageBox.information(self, "下载进行中", "请先完成或取消下载。")
             return
-
-        # Clear cookies
-        self._auth.clear()
-        self._ytm = None
-        self._songs.clear()
-        self._playlists.clear()
-        self._song_list.set_songs([])
-        self._sidebar.set_playlists([])
-        self._login_status.setText("🔒 未登录")
-        self._login_status.setStyleSheet("color: #f38ba8;")
-
-    def _export_cookies(self):
-        """Export cookies file to user-chosen location (backup)."""
-        if not self._auth.has_cookies:
-            QMessageBox.information(self, "提示", "尚未登录，没有可导出的 Cookies。")
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出 Cookies 文件",
-            "cookies.txt",
-            "Cookies 文件 (*.txt);;所有文件 (*)",
-        )
-        if not path:
-            return
-
         try:
-            import shutil
-            shutil.copy2(self._auth.cookies_path, path)
-            QMessageBox.information(self, "导出成功", f"Cookies 已导出到：\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+            previous_id = self._active_account_id
+            self.library.logout()
+            if self._accounts.label(previous_id):
+                self._accounts.forget(previous_id)
+            self._active_account_id = ""
+            self._pending_account_label = ""
+            self._refresh_account_choices()
+        except OSError:
+            self._signed_out()
+            self._error("storage", "已断开会话，但无法清除本地会话文件。")
+
+    def _busy(self, kind, busy):
+        if busy:
+            self._errors.pop(kind, None)
+        if kind == "login":
+            if self._login_dialog:
+                self._login_dialog.set_busy(busy)
+            self._account_combo.setEnabled(not busy)
+            self._login_button.setEnabled(not busy)
+            self._relogin_button.setEnabled(not busy)
+            if busy:
+                self._login_status.setText("正在验证登录…")
+            elif not self.library.client:
+                self._login_status.setText("未登录")
+        if kind == "tracks":
+            self._song_list.setEnabled(not busy and bool(self.library.client))
+            if busy:
+                self._summary = f"正在加载：{self._current_title}…"
+        self._render_message()
+
+    def _error(self, kind, message):
+        if kind == "login" and self._login_dialog:
+            self._login_dialog.show_error(message)
+        self._errors[kind] = message
+        if kind == "tracks":
+            self._summary = f"{self._current_title} · 加载失败"
+        self._render_message()
+
+    def _render_message(self):
+        self._message.setText("\n".join([self._summary, *self._errors.values()]))
+        self._retry_button.setVisible(bool(self._errors) and bool(self.library.client))
 
     def _refresh_library(self):
-        """Manually refresh the music library (playlists + liked songs)."""
-        if not self._ytm:
-            QMessageBox.information(self, "提示", "请先登录 YouTube Music 账号。")
+        if self.library.client:
+            self.library.refresh()
+            self._select(self._current_playlist_id, self._current_title)
+
+    def _playlists_ready(self, playlists):
+        # Keep a manually opened or recently removed playlist selected, so that
+        # the navigation and currently displayed tracks cannot disagree.
+        if self._current_playlist_id != "LM" and not any(p.playlist_id == self._current_playlist_id for p in playlists):
+            playlists = playlists + [Playlist(self._current_playlist_id, self._current_title)]
+        self._playlists = playlists
+        self._sidebar.set_playlists(playlists)
+        self._sidebar.select(self._current_playlist_id)
+        alias = self._pending_account_label or self._accounts.label(self._active_account_id)
+        prefix = (f"Google 账号：{self._account_name}" if self._account_identity_available else
+                  "音乐库已连接（账号身份未验证）")
+        if alias:
+            prefix = f"{alias} · {prefix}"
+        self._login_status.setText(f"{prefix} · {len(playlists)} 个播放列表")
+        if playlists:
+            QTimer.singleShot(0, self._sync_saved_account)
+
+    def _select(self, playlist_id, title):
+        if not self.library.client:
             return
-        self._load_library(is_refresh=True)
+        self._current_playlist_id, self._current_title = playlist_id, title
+        self._sidebar.select(playlist_id)
+        self._song_list.set_songs([])
+        self._songs = []
+        self.library.load_tracks(playlist_id)
 
-    # ═══════════════════════════════════════════════════════
-    #  Library Loading
-    # ═══════════════════════════════════════════════════════
-
-    def _load_library(self, is_refresh: bool = False):
-        """加载用户音乐库（播放列表 + 喜欢的歌曲）。
-
-        ⚠️ 此方法在主线程同步执行 HTTP 请求！
-        对于拥有大量歌曲的用户（5000+），ytmusicapi 请求可能耗时
-        5-30 秒，期间 UI 完全冻结。processEvents() 仅在开头调用一次。
-
-        建议优化：将此方法移到后台线程，通过 Signal 返回结果。
-
-        Args:
-            is_refresh: True 表示手动刷新，False 表示首次加载
-        """
-        if not self._ytm:
+    def _tracks_ready(self, playlist_id, batch):
+        if playlist_id != self._current_playlist_id:
             return
+        self._songs = batch.songs
+        # A record is reusable only while its downloaded file still exists.
+        self._restore_download_status()
+        self._song_list.set_songs(self._songs)
+        self._song_list.setEnabled(True)
+        if playlist_id == "LM":
+            self._sidebar.set_liked_count(len(batch.songs))
+        text = f"{self._current_title} · {len(batch.songs)} 首可用歌曲"
+        if batch.skipped:
+            text += f" · {batch.skipped} 项不可用或无视频 ID"
+        if not batch.songs:
+            text += "（空列表）"
+            if not self._account_verified and not self._account_identity_available and not self._playlists:
+                text += "。若预期有收藏，请重新导出完整的 YouTube Music 登录 Cookie。"
+        self._summary = text
+        self._render_message()
+        if playlist_id == "LM" and batch.songs:
+            QTimer.singleShot(0, self._sync_saved_account)
 
-        try:
-            prefix = "🔄 刷新中" if is_refresh else "⏳ 加载中"
-            self._login_status.setText(f"{prefix}...")
-            self._login_status.setStyleSheet("color: #f9e2af;")
-            QApplication.processEvents()
-
-            # Load playlists list
-            self._playlists = self._ytm.get_playlists()
-            self._sidebar.set_playlists(self._playlists)
-
-            # Load liked songs by default (or keep current playlist)
-            songs = self._ytm.get_liked_songs()
-            self._songs = songs
-            self._sidebar.set_liked_count(len(songs))
-            self._mark_downloaded_status()
-            self._song_list.set_songs(self._songs)
-            self._current_playlist_id = None
-
-            self._login_status.setText(
-                f"✅ 已登录 — {len(self._playlists)} 个播放列表，{len(songs)} 首喜欢的歌"
-            )
-            self._login_status.setStyleSheet("color: #a6e3a1;")
-
-        except Exception as e:
-            QMessageBox.warning(self, "加载失败", f"无法加载音乐库：\n{str(e)}")
-            self._login_status.setText("⚠ 加载失败")
-            self._login_status.setStyleSheet("color: #f38ba8;")
-
-    def _mark_downloaded_status(self):
-        """Mark songs that have been downloaded before."""
-        downloaded_ids = set(self._db.get_downloaded_ids())
+    def _restore_download_status(self):
+        media_type = media_type_for_download(self._config.download_mode, self._config.audio_format)
+        records = {r[0]: r[5] for r in self._db.get_all_records(media_type)
+                   if r[8] == "completed" and r[5] and os.path.isfile(r[5])}
         for song in self._songs:
-            if song.video_id in downloaded_ids:
+            song.download_mode = self._config.download_mode
+            song.audio_format = self._config.audio_format
+            song.status, song.file_path, song.error_msg = DownloadStatus.PENDING, "", ""
+            if song.video_id in records:
                 song.status = DownloadStatus.COMPLETED
+                song.file_path = records[song.video_id]
 
-    # ═══════════════════════════════════════════════════════
-    #  Playlist selection
-    # ═══════════════════════════════════════════════════════
+    def _mode_changed(self, *_):
+        self._apply_selected_download_type()
+        self._config.save()
+        self._restore_download_status()
+        self._song_list.set_songs(self._songs)
 
-    @Slot()
-    def _on_liked_selected(self):
-        """Liked songs selected in sidebar."""
-        if not self._ytm:
+    def _apply_selected_download_type(self):
+        selected = self._mode_combo.currentData()
+        if selected == "video":
+            self._config.download_mode = "video"
+        else:
+            self._config.download_mode = "audio"
+            self._config.audio_format = "flac" if selected == "audio_flac" else "mp3"
+
+    def _open_playlist(self):
+        value, ok = QInputDialog.getText(self, "打开播放列表", "粘贴 YouTube Music / YouTube 歌单链接或 ID：")
+        if not ok:
             return
-        self._current_playlist_id = None
         try:
-            songs = self._ytm.get_liked_songs()
-            self._songs = songs
-            self._mark_downloaded_status()
-            self._song_list.set_songs(self._songs)
-        except Exception as e:
-            QMessageBox.warning(self, "错误", f"无法加载喜欢列表：{str(e)}")
-
-    @Slot(str, str)
-    def _on_playlist_selected(self, playlist_id: str, title: str):
-        """A playlist was selected in sidebar."""
-        if not self._ytm:
+            pid = parse_playlist_id(value)
+        except ServiceError as exc:
+            self._error("tracks", str(exc))
             return
-        self._current_playlist_id = playlist_id
-        try:
-            songs = self._ytm.get_playlist_songs(playlist_id)
-            self._songs = songs
-            self._mark_downloaded_status()
-            self._song_list.set_songs(self._songs)
-        except Exception as e:
-            QMessageBox.warning(self, "错误", f"无法加载播放列表：{str(e)}")
+        title = next((p.title for p in self._playlists if p.playlist_id == pid), pid)
+        if not any(p.playlist_id == pid for p in self._playlists) and pid != "LM":
+            self._playlists.append(Playlist(pid, title))
+            self._sidebar.set_playlists(self._playlists)
+        self._select(pid, title)
 
-    # ═══════════════════════════════════════════════════════
-    #  Download orchestration
-    # ═══════════════════════════════════════════════════════
-
-    @Slot(list)
-    def _on_download_clicked(self, songs: list[Song]):
-        """Start downloading selected songs."""
-        if self._downloading:
-            QMessageBox.information(self, "提示", "已有下载任务在进行中。")
-            return
-
-        # Ensure output directory exists
-        download_dir = self._config.download_dir
-        if self._config.create_playlist_folders and self._current_playlist_id:
-            # Find playlist name
-            for pl in self._playlists:
-                if pl.playlist_id == self._current_playlist_id:
-                    download_dir = os.path.join(download_dir, _safe_name(pl.title))
-                    break
-
-        os.makedirs(download_dir, exist_ok=True)
-
-        # Filter already downloaded
-        to_download = []
-        for song in songs:
-            if song.status != DownloadStatus.COMPLETED:
-                song.status = DownloadStatus.PENDING
-                to_download.append(song)
-
-        if not to_download:
-            QMessageBox.information(self, "提示", "所选歌曲均已下载完成。")
-            return
-
-        self._downloading = True
-        self._overall_progress.setVisible(True)
-        self._overall_progress.setMaximum(len(to_download))
-        self._overall_progress.setValue(0)
-        self._song_list.set_songs(self._songs)  # refresh display
-
-        # Create downloader (with cookies + proxy for authenticated downloads)
-        self._downloader = Downloader(
-            download_dir=download_dir,
-            audio_quality=self._config.audio_quality,
-            filename_template=self._config.filename_template,
-            cookies_path=self._auth.cookies_path if self._auth.has_cookies else "",
-            proxy_url=self._config.proxy_url,
-        )
-
-        # Create queue manager
-        self._queue = QueueManager(
-            max_workers=self._config.concurrent_downloads,
-            max_retries=self._config.max_retries,
-            retry_delay=self._config.retry_delay,
-        )
-
-        # Run in background thread
-        thread = threading.Thread(
-            target=self._run_download_queue,
-            args=(to_download,),
-            daemon=True,
-        )
-        thread.start()
-
-    def _run_download_queue(self, songs: list[Song]):
-        """Background download runner."""
-        def download_fn(song: Song) -> bool:
-            """Wrapped download with progress callbacks."""
-            def on_progress(percent, speed, eta):
-                song.progress = percent
-                song.speed = speed
-                self.progress_updated.emit(song.video_id, percent, speed, eta)
-
-            def on_status(status: DownloadStatus):
-                song.status = status
-                self.status_updated.emit(song)
-
-            success = self._downloader.download(
-                song,
-                progress_callback=on_progress,
-                status_callback=on_status,
-            )
-            return success
-
-        def on_complete(song: Song, success: bool):
-            """Called when a song finishes."""
-            if success:
-                # Write metadata
-                self._metadata.write(song)
-                # Record in database
-                self._db.mark_downloaded(
-                    video_id=song.video_id,
-                    title=song.title,
-                    artist=song.artist,
-                    album=song.album,
-                    duration=song.duration,
-                    file_path=song.file_path,
-                )
-            self.status_updated.emit(song)
-
-        def on_status(song: Song, status: DownloadStatus):
-            self.status_updated.emit(song)
-
-        self._queue.start(
-            songs,
-            download_fn=download_fn,
-            on_status=on_status,
-            on_complete=on_complete,
-        )
-
-        # Completion signal
-        self.status_updated.emit(Song(video_id="__done__", title=""))
-
-    # ═══════════════════════════════════════════════════════
-    #  Status update slots (called from any thread)
-    # ═══════════════════════════════════════════════════════
-
-    @Slot(Song)
-    def _on_status_updated(self, song: Song):
-        """Handle status update for a single song."""
-        if song.video_id == "__done__":
-            # Download queue complete
-            self._downloading = False
-            self._overall_progress.setVisible(False)
-            self._speed_label.setText("")
-            self._count_label.setText("✅ 下载完成")
-            self._song_list.set_songs(self._songs)
-            return
-
-        # Update song in list
-        for s in self._songs:
-            if s.video_id == song.video_id:
-                s.status = song.status
-                s.error_msg = song.error_msg
-                s.file_path = song.file_path
-                break
-
-        self._song_list.update_song_status(song)
-
-        # Update overall progress
-        completed = sum(
-            1 for s in self._songs
-            if s.status in (DownloadStatus.COMPLETED, DownloadStatus.SKIPPED)
-        )
-        total = sum(
-            1 for s in self._songs
-            if s.status != DownloadStatus.PENDING
-        )
-        downloading = sum(
-            1 for s in self._songs
-            if s.status == DownloadStatus.DOWNLOADING
-        )
-
-        # actual_total = 所有参与下载的歌曲总数（含已完成、下载中、待下载、失败、暂停）
-        actual_total = sum(
-            1 for s in self._songs
-            if s.status in (DownloadStatus.COMPLETED, DownloadStatus.SKIPPED,
-                           DownloadStatus.DOWNLOADING, DownloadStatus.PENDING,
-                           DownloadStatus.FAILED, DownloadStatus.PAUSED)
-        )
-        if actual_total > 0:
-            self._overall_progress.setMaximum(actual_total)
-            self._overall_progress.setValue(completed)
-        self._count_label.setText(f"{completed}/{actual_total}")
-
-    @Slot(str, float, str, str)
-    def _on_progress_updated(self, video_id: str, percent: float, speed: str, eta: str):
-        """Handle download progress update."""
-        self._speed_label.setText(f"⬇ {speed}" if speed else "")
-        if eta:
-            self._speed_label.setText(f"⬇ {speed}  剩余 {eta}" if speed else f"剩余 {eta}")
-
-    # ═══════════════════════════════════════════════════════
-    #  Menu actions
-    # ═══════════════════════════════════════════════════════
-
-    def _open_settings(self):
-        """Open settings dialog."""
-        from .settings_dialog import SettingsDialog
+    def _settings(self):
+        previous_proxy = self._config.proxy_url
         dialog = SettingsDialog(self._config, self)
         if dialog.exec():
-            # Config already updated in-place by dialog
             self._config.save()
+            self._proxy_label.setText(proxy_description(self._config.proxy_url))
+            if previous_proxy != self._config.proxy_url and self.library.client:
+                self._message.setText("下载代理设置已更新。若要切换音乐库使用的系统或手动代理，请重新登录。")
 
-    def _open_guide(self):
-        """Open the usage guide."""
-        import webbrowser
-        guide_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "GUIDE.md"
-        )
-        if os.path.exists(guide_path):
-            webbrowser.open(f"file:///{guide_path.replace(os.sep, '/')}")
-        else:
-            QMessageBox.information(
-                self,
-                "使用指南",
-                "GUIDE.md 文件未找到。\n\n"
-                "请参考 README.md 或项目文档获取使用帮助。"
-            )
+    def _download_playlist(self):
+        if self._songs:
+            self._download(list(self._songs))
 
-    def _show_about(self):
-        """Show about dialog."""
-        QMessageBox.about(
-            self,
-            "关于 YtMusicVault",
-            "<h3>YtMusicVault</h3>"
-            "<p>YouTube Music 批量下载器</p>"
-            "<p>版本 1.0.0</p>"
-            "<p>下载您的 YouTube Music 收藏到本地，自动写入封面和元数据。</p>"
-            "<hr>"
-            "<p>技术栈：PySide6 + yt-dlp + ytmusicapi + mutagen</p>",
-        )
+    def _download(self, songs, mode=None, audio_format=None):
+        if self.downloads.running or not self.library.credentials:
+            return
+        config = replace(self._config)
+        if mode in ("audio_flac", "audio_mp3"):
+            config.download_mode = "audio"
+            config.audio_format = "flac" if mode == "audio_flac" else "mp3"
+        elif mode:
+            config.download_mode = mode
+        if audio_format in ("flac", "mp3", "m4a"):
+            config.audio_format = audio_format
+        media_type = media_type_for_download(config.download_mode, config.audio_format)
+        existing = {record[0] for record in self._db.get_all_records(media_type)
+                    if record[8] == "completed" and record[5] and os.path.isfile(record[5])}
+        songs = [replace(song, download_mode=config.download_mode, audio_format=config.audio_format,
+                         file_path="", error_msg="", progress=0, speed="", stage="")
+                 for song in songs if song.video_id not in existing]
+        if not songs:
+            self._download_label.setText("这些歌曲已按所选类型下载。")
+            return
+        if config.create_playlist_folders:
+            config.download_dir = str(Path(config.download_dir) / (safe_filename(self._current_title) or "Playlist"))
+        self._batch_done = set()
+        self.downloads.start(songs, config, self.library.credentials)
+        self._download_page.set_batch(songs)
+        self._pages.setCurrentIndex(1)
+        self._mode_combo.setEnabled(False)
+        self._progress.setRange(0, self.downloads.total)
+        self._progress.setValue(0)
+        self._progress.show()
 
-    # ═══════════════════════════════════════════════════════
-    #  Close event
-    # ═══════════════════════════════════════════════════════
+    def _download_updated(self, song):
+        if (song.download_mode == self._config.download_mode and
+                (song.download_mode == "video" or song.audio_format == self._config.audio_format)):
+            for index, current in enumerate(self._songs):
+                if current.video_id == song.video_id:
+                    self._songs[index] = song
+            self._song_list.update_song_status(song)
+        self._download_page.update_task(song)
+        if song.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.PAUSED):
+            self._batch_done.add(song.video_id)
+        self._progress.setValue(len(self._batch_done))
+        stage = f" · {song.stage}" if song.stage else ""
+        self._download_label.setText(f"{song.title}{stage} · {song.progress:.0f}% {song.speed} {song.error_msg}")
+
+    def _download_finished(self, songs):
+        self._mode_combo.setEnabled(True)
+        self._download_page.finish_batch(songs)
+        self._download_page.set_history(self._db.get_all_records())
+        self._restore_download_status()
+        self._song_list.set_songs(self._songs)
+        completed = sum(s.status == DownloadStatus.COMPLETED for s in songs)
+        self._download_label.setText(f"本批结束：成功 {completed} / {len(songs)}，失败或取消 {len(songs) - completed}")
+        self._progress.hide()
+        if self._closing:
+            self.close()
+
+    def _retry_download(self, song):
+        if not self.library.credentials:
+            QMessageBox.information(self, "尚未登录", "请先选择或登录账号，再重试下载。")
+            return
+        self._download([song], mode=song.download_mode, audio_format=song.audio_format)
+
+    def _open_log_file(self, path):
+        if path and Path(path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).resolve())))
+
+    def _open_local_file(self, path):
+        if not path or not Path(path).is_file():
+            QMessageBox.warning(self, "文件不存在", "本地文件已移动或删除，请在下载页面刷新记录。")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).resolve()))):
+            QMessageBox.warning(self, "无法打开", "系统未能打开该文件，请检查默认播放器。")
+
+    def _open_source_page(self, video_id):
+        if not video_id:
+            return
+        url = QUrl("https://music.youtube.com/watch?v=" + quote(video_id, safe=""))
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, "无法打开", "系统未能打开源页面，请检查浏览器设置。")
 
     def closeEvent(self, event):
-        """窗口关闭事件 — 保存配置并清理资源。
-
-        ⚠️ 审查发现：此方法未取消进行中的下载任务。
-        如果用户在下载时关闭窗口，worker 线程可能继续尝试写入
-        已关闭的数据库连接，导致崩溃。
-        建议加上：
-            if self._queue and self._queue.is_running:
-                self._queue.cancel()
-        """
-        self._config.window_width = self.width()
-        self._config.window_height = self.height()
+        if self.downloads.running:
+            self._closing = True
+            self.downloads.cancel()
+            self._message.setText("正在停止下载，完成清理后关闭…")
+            event.ignore()
+            return
+        self.library.close()
+        self._config.window_width, self._config.window_height = self.width(), self.height()
         self._config.save()
         self._db.close()
         event.accept()
-
-
-def _safe_name(name: str) -> str:
-    """Make a playlist name safe for folder use."""
-    unsafe = '<>:"/\\|?*'
-    for ch in unsafe:
-        name = name.replace(ch, "_")
-    return name.strip()[:100]

@@ -1,63 +1,159 @@
-"""认证模块 — 基于 Cookies 的 YouTube Music 登录。
-
-认证策略（无需 OAuth，无需 Google API Key）：
-    1. 用户在嵌入式浏览器（login_browser.py）登录 music.youtube.com
-    2. 登录成功后提取两类凭据：
-       - cookies.txt  (Netscape 格式) → 给 yt-dlp 下载引擎使用
-       - headers.json (HTTP headers)    → 给 ytmusicapi 库使用
-    3. headers.json 包含 Cookie 头 + SAPISIDHASH 授权头
-
-为什么不用 OAuth？
-    - OAuth 需要 Google Cloud 项目，普通用户难以配置
-    - Cookies 方式与浏览器登录体验一致，支持二步验证
-    - yt-dlp 原生支持 --cookies 参数
-
-⚠️ 安全提醒：cookies.txt 和 headers.json 包含敏感凭据，切勿分享！
-"""
-
-import os
+"""Credential inputs and atomic storage. No network or Qt dependency here."""
 import json
-import logging
+import os
+import tempfile
+from dataclasses import dataclass, field
+from http.cookiejar import MozillaCookieJar
+from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Optional
+from ytmusicapi.helpers import get_authorization
 
-from ytmusicapi import YTMusic
+ORIGIN = "https://music.youtube.com"
+BROWSERS = ("edge", "chrome", "firefox", "brave", "vivaldi", "opera", "chromium")
+LEGACY_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                     "AppleWebKit/537.36 (KHTML, like Gecko) "
+                     "Chrome/120.0.0.0 Safari/537.36")
 
-_log = logging.getLogger(__name__)
+
+class AuthError(ValueError):
+    """Safe user-facing error, never includes credential contents."""
+
+
+@dataclass(frozen=True)
+class Credentials:
+    headers: dict = field(repr=False)
+    source: str = "headers"
+    download_cookie_text: str = field(default="", repr=False, compare=False)
+
+    def download_cookies(self):
+        if self.download_cookie_text:
+            return self.download_cookie_text
+        jar = SimpleCookie()
+        jar.load(self.headers["cookie"])
+        lines = ["# Netscape HTTP Cookie File"]
+        for key, cookie in jar.items():
+            lines.append(f".youtube.com\tTRUE\t/\tTRUE\t0\t{key}\t{cookie.value}")
+        return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True)
+class LoginRequest:
+    kind: str
+    value: str = field(default="", repr=False)
+    profile: str = ""
+    account_index: str = "0"
+    remember: bool = False
+
+
+def normalize_headers(raw, source="headers"):
+    if not isinstance(raw, dict):
+        raise AuthError("请求头必须是 JSON 对象或浏览器复制的请求头文本。")
+    allowed = {"cookie", "x-goog-authuser", "x-goog-pageid", "x-goog-visitor-id", "user-agent"}
+    headers = {str(k).lower(): v for k, v in raw.items() if str(k).lower() in allowed}
+    if any(not isinstance(v, str) or any(c in v for c in "\r\n\t\x00") for v in headers.values()):
+        raise AuthError("请求头格式无效，请重新复制完整请求头。")
+    jar = SimpleCookie()
+    try:
+        jar.load(headers.get("cookie", ""))
+    except Exception:
+        raise AuthError("Cookie 格式无效。") from None
+    secret = jar.get("__Secure-3PAPISID")
+    if not secret or not secret.value:
+        raise AuthError("缺少 __Secure-3PAPISID 登录 Cookie。请在浏览器登录 music.youtube.com 后重新导入。")
+    if any(any(c in item.value for c in "\r\n\t\x00") for item in jar.values()):
+        raise AuthError("Cookie 内容含无效字符。")
+    account = headers.get("x-goog-authuser", "0")
+    if not account.isdigit():
+        raise AuthError("账号序号必须是非负整数。")
+    headers.update({"accept": "*/*", "content-type": "application/json",
+                    "x-goog-authuser": account, "origin": ORIGIN, "x-origin": ORIGIN,
+                    "authorization": get_authorization(secret.value + " " + ORIGIN)})
+    # The original cookies.txt login supplied a browser User-Agent. Keep that
+    # request shape for file and browser imports without replacing pasted UAs.
+    headers.setdefault("user-agent", LEGACY_USER_AGENT)
+    # ytmusicapi regenerates SAPISIDHASH for every request.
+    return Credentials(headers, source)
+
+
+def parse_headers(text):
+    if not text.strip():
+        # ytmusicapi.setup treats empty input as an interactive CLI prompt.
+        raise AuthError("请先粘贴浏览器请求头。")
+    try:
+        if text.lstrip().startswith("{"):
+            raw = json.loads(text)
+        else:
+            from ytmusicapi import setup
+            raw = json.loads(setup(headers_raw=text))
+        return normalize_headers(raw)
+    except AuthError:
+        raise
+    except Exception:
+        raise AuthError("无法解析请求头。请粘贴 /browse 请求的完整请求头，或仅包含请求头的 JSON。") from None
+
+
+def from_cookie_jar(jar, source, account_index="0"):
+    selected = {}
+    for cookie in sorted(jar, key=lambda c: len(c.domain or "")):
+        # Browser exporters commonly encode a session cookie as expiry=0.
+        if cookie.expires == 0:
+            cookie.expires = None
+        domain = (cookie.domain or "").lstrip(".").lower()
+        if domain not in {"youtube.com", "music.youtube.com"} or cookie.is_expired():
+            continue
+        if not cookie.value or any(c in cookie.value for c in "\r\n\t;\x00"):
+            continue
+        selected[cookie.name] = cookie.value
+    return normalize_headers({"cookie": "; ".join(f"{k}={v}" for k, v in selected.items()),
+                              "x-goog-authuser": str(account_index)}, source)
+
+
+def download_cookie_text(jar):
+    """Keep extracted YouTube cookie scope/expiry for yt-dlp --cookies."""
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in jar:
+        domain = (cookie.domain or "").lstrip(".").lower()
+        if domain != "youtube.com" and not domain.endswith(".youtube.com"):
+            continue
+        if cookie.expires not in (None, 0) and cookie.is_expired():
+            continue
+        if not cookie.name or not cookie.value or any(
+                bad in cookie.name + cookie.value for bad in "\r\n\t\x00"):
+            continue
+        host = cookie.domain or "youtube.com"
+        subdomains = cookie.domain_initial_dot or host.startswith(".")
+        if subdomains and not host.startswith("."):
+            host = "." + host
+        lines.append("\t".join((host, "TRUE" if subdomains else "FALSE",
+                                cookie.path or "/", "TRUE" if cookie.secure else "FALSE",
+                                str(cookie.expires or 0), cookie.name, cookie.value)))
+    return "\n".join(lines) + "\n"
+
+
+def detect_browsers():
+    local, roaming = os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")
+    roots = {"edge": (local, "Microsoft/Edge/User Data"),
+             "chrome": (local, "Google/Chrome/User Data"),
+             "firefox": (roaming, "Mozilla/Firefox/Profiles"),
+             "brave": (local, "BraveSoftware/Brave-Browser/User Data"),
+             "vivaldi": (local, "Vivaldi/User Data"),
+             "opera": (roaming, "Opera Software/Opera Stable"),
+             "chromium": (local, "Chromium/User Data")}
+    return [name for name, (base, suffix) in roots.items() if base and (Path(base) / suffix).is_dir()]
+
+
+class _QuietCookieLogger:
+    def debug(self, *args, **kwargs): pass
+    def info(self, *args, **kwargs): pass
+    def warning(self, *args, **kwargs): pass
+    def error(self, *args, **kwargs):
+        raise AuthError("浏览器 Cookie 读取失败。请尝试请求头登录。")
 
 
 class AuthManager:
-    """管理 YouTube Music 的 Cookies + Headers 认证。
-    
-    职责：
-      1. 维护 cookies.txt 和 headers.json 的路径
-      2. 检测是否已有有效凭据（has_cookies）
-      3. 用 headers.json 创建 YTMusic 实例（login）
-      4. 清除凭据（clear）
-    
-    存储位置：%APPDATA%/YtMusicVault/（Windows）或 ~/YtMusicVault/（其他平台）
-    """
-
-    def __init__(self, config_dir: Optional[str] = None):
-        """初始化 AuthManager。
-        
-        Args:
-            config_dir: 凭据存储目录。为 None 时自动使用系统默认路径。
-        """
-        if config_dir is None:
-            # Windows: %APPDATA%/YtMusicVault/
-            # 其他: ~/YtMusicVault/
-            config_dir = os.path.join(
-                os.environ.get("APPDATA", str(Path.home())),
-                "YtMusicVault"
-            )
-        self._config_dir = config_dir
-        # cookies.txt — Netscape 格式，给 yt-dlp 用
-        self._cookies_path = os.path.join(config_dir, "cookies.txt")
-        # headers.json — HTTP Headers，给 ytmusicapi 用
-        self._headers_path = os.path.join(config_dir, "headers.json")
-        # 确保目录存在（exist_ok=True 不会抛异常）
-        os.makedirs(config_dir, exist_ok=True)
+    def __init__(self, config_dir=None):
+        self.directory = Path(config_dir or Path(os.environ.get("APPDATA", str(Path.home()))) / "YtMusicVault")
+        self.path = self.directory / "session.json"
 
     @property
     def cookies_path(self) -> str:
@@ -221,12 +317,5 @@ class AuthManager:
             return None
 
     def clear(self):
-        """删除所有已保存的凭据文件（cookies.txt + headers.json）。
-        
-        用于用户登出或凭据损坏时清理。
-        """
-        for path in (self._cookies_path, self._headers_path):
-            if os.path.exists(path):
-                os.remove(path)
-                _log.info(f"Removed {path}")
-                _log.info(f"Removed {path}")
+        for name in ("session.json", "headers.json", "cookies.txt"):
+            (self.directory / name).unlink(missing_ok=True)
