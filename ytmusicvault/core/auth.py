@@ -156,165 +156,67 @@ class AuthManager:
         self.path = self.directory / "session.json"
 
     @property
-    def cookies_path(self) -> str:
-        """Netscape cookies.txt 的完整路径（供 yt-dlp --cookies 使用）。"""
-        return self._cookies_path
+    def has_saved_session(self):
+        return self.path.is_file() or (self.directory / "headers.json").is_file()
 
-    @property
-    def headers_path(self) -> str:
-        """headers.json 的完整路径（供 ytmusicapi auth= 参数使用）。"""
-        return self._headers_path
-
-    @property
-    def has_cookies(self) -> bool:
-        """Return whether a usable generated header file is present."""
-        return (
-            os.path.isfile(self._headers_path)
-            and os.path.getsize(self._headers_path) > 0
-            and os.path.isfile(self._cookies_path)
-            and os.path.getsize(self._cookies_path) > 0
-        )
-
-    def import_cookies(self, source_path: str) -> None:
-        """Import a Netscape cookies.txt and generate ytmusicapi headers.
-
-        Browser exports contain the cookies needed by yt-dlp, while
-        ytmusicapi expects a JSON headers file (including SAPISIDHASH).
-        Keeping this conversion here makes file import and embedded-browser
-        login use the same credential contract.
-        """
-        import shutil
-        import time
-        import hashlib
-
-        source = Path(source_path)
-        if not source.is_file():
-            raise ValueError("Cookies 文件不存在")
-        rows = []
-        auth_names = {
-            "LOGIN_INFO", "SID", "HSID", "SSID", "APISID", "SAPISID",
-            "__Secure-3PSID", "__Secure-3PAPISID",
-        }
-        with source.open("r", encoding="utf-8-sig", errors="replace") as f:
-            for line_no, raw_line in enumerate(f, 1):
-                line = raw_line.rstrip("\r\n")
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split("\t")
-                if len(fields) != 7:
-                    raise ValueError(f"Cookies 文件第 {line_no} 行不是 7 列 Netscape 格式")
-                domain, flag, path, secure, expires, name, value = fields
-                if not domain or not path or not name:
-                    raise ValueError(f"Cookies 文件第 {line_no} 行包含空字段")
-                try:
-                    expiry = int(expires)
-                except ValueError as exc:
-                    raise ValueError(f"Cookies 文件第 {line_no} 行过期时间无效") from exc
-                if expiry and expiry < int(time.time()):
-                    continue
-                rows.append((domain, flag, path, secure, expires, name, value))
-
-        if not rows:
-            raise ValueError("Cookies 文件为空或所有 Cookie 均已过期")
-        if not any(row[5] in auth_names for row in rows):
-            raise ValueError("Cookies 文件中未找到 Google 登录凭据")
-        if not any(row[5] in {"__Secure-3PAPISID", "SAPISID", "APISID"} for row in rows):
-            raise ValueError("Cookies 文件中未找到 SAPISID 授权凭据")
-
-        # Keep the original Netscape export for yt-dlp.
-        os.makedirs(self._config_dir, exist_ok=True)
-        shutil.copy2(source, self._cookies_path)
-
-        # A request must contain one value per cookie name. Prefer the most
-        # specific domain when browser exports contain duplicates.
-        by_name = {}
-        domain_rank = lambda d: (
-            3 if d in ("music.youtube.com", "www.youtube.com") else
-            2 if "youtube.com" in d else
-            1 if "google.com" in d else 0
-        )
-        for row in rows:
-            current = by_name.get(row[5])
-            if current is None or domain_rank(row[0]) >= domain_rank(current[0]):
-                by_name[row[5]] = row
-        cookie_header = "; ".join(
-            f"{row[5]}={row[6]}" for row in by_name.values()
-        )
-
-        sapisid = ""
-        for name in ("__Secure-3PAPISID", "SAPISID", "APISID"):
-            if name in by_name:
-                sapisid = by_name[name][6]
-                break
-        timestamp = str(int(time.time()))
-        digest = hashlib.sha1(
-            f"{timestamp} {sapisid}".encode("utf-8")
-        ).hexdigest()
-        headers = {
-            "cookie": cookie_header,
-            "authorization": f"SAPISIDHASH {timestamp}_{digest}",
-            "x-goog-authuser": "0",
-            "x-origin": "https://music.youtube.com",
-            "user-agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "accept": "*/*",
-            "content-type": "application/json",
-        }
-        temp_path = self._headers_path + ".tmp"
+    def prepare(self, request):
+        if request.kind == "saved":
+            return self.load()
+        if request.kind == "headers":
+            return parse_headers(request.value)
+        jar = MozillaCookieJar()
         try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(headers, f, indent=2)
-            os.replace(temp_path, self._headers_path)
+            if request.kind == "browser":
+                if request.value not in BROWSERS:
+                    raise AuthError("请选择支持的浏览器。")
+                from yt_dlp.cookies import extract_cookies_from_browser
+                jar = extract_cookies_from_browser(request.value, request.profile or None,
+                                                   logger=_QuietCookieLogger())
+            elif request.kind == "file":
+                jar.load(request.value, ignore_discard=True, ignore_expires=True)
+            elif request.kind == "embedded":
+                # MozillaCookieJar's parser is file based; keep this temporary
+                # export isolated and delete it immediately after parsing.
+                with tempfile.TemporaryDirectory(prefix="ytmv-cookie-") as folder:
+                    path = Path(folder) / "cookies.txt"
+                    path.write_text(request.value, encoding="utf-8")
+                    jar.load(str(path), ignore_discard=True, ignore_expires=True)
+            else:
+                raise AuthError("未知的登录方式。")
+            credentials = from_cookie_jar(jar, request.kind, request.account_index)
+            return Credentials(credentials.headers, request.kind, download_cookie_text(jar))
+        except AuthError:
+            raise
+        except Exception:
+            raise AuthError("浏览器或 Cookie 文件读取失败，请重新导出或使用请求头登录。") from None
+
+    def load(self):
+        source = self.path if self.path.is_file() else self.directory / "headers.json"
+        try:
+            data = json.loads(source.read_text(encoding="utf-8"))
+            if source == self.path:
+                credentials = normalize_headers(data["headers"], data.get("source", "saved"))
+                text = data.get("download_cookie_text", "")
+                if not isinstance(text, str):
+                    raise ValueError("Invalid cookie text")
+                return Credentials(credentials.headers, credentials.source, text)
+            return normalize_headers(data, "saved")
+        except Exception:
+            raise AuthError("已保存的会话无法读取，请重新登录。") from None
+
+    def save(self, credentials):
+        validated = normalize_headers(credentials.headers, credentials.source)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".session-", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "headers": validated.headers, "source": credentials.source,
+                           "download_cookie_text": credentials.download_cookies()}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, self.path)
         finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        try:
-            os.chmod(self._cookies_path, 0o600)
-            os.chmod(self._headers_path, 0o600)
-        except OSError:
-            pass
-
-    def login(self, proxy_url: str = "") -> Optional[YTMusic]:
-        """用 headers.json 创建 YTMusic 实例。
-        
-        YTMusic 是 ytmusicapi 库的主入口，提供 get_liked_songs、
-        get_playlist 等 API 方法。
-        
-        Args:
-            proxy_url: 代理 URL（如 http://127.0.0.1:1080），为空则不使用代理
-        Returns:
-            YTMusic 实例（登录成功）或 None（未登录/凭据损坏）
-        """
-        if not self.has_cookies:
-            _log.info("No headers.json found — user needs to log in")
-            return None
-        try:
-            # 先验证 JSON 格式，避免传损坏的文件给 ytmusicapi 导致难以调试的错误
-            with open(self._headers_path, encoding="utf-8") as f:
-                json.load(f)
-
-            # ytmusicapi 底层使用 requests 库 → 通过 proxies 参数设置代理
-            extra_kwargs = {}
-            if proxy_url:
-                extra_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-                _log.info(f"Using proxy for ytmusicapi: {proxy_url}")
-
-            # auth= 参数接受 headers.json 文件路径，自动读取 Cookie 和 Authorization
-            ytm = YTMusic(auth=self._headers_path, **extra_kwargs)
-            _log.info("Logged in via headers.json")
-            return ytm
-        except json.JSONDecodeError:
-            # headers.json 损坏（如写入过程被中断）→ 清除凭据让用户重新登录
-            _log.warning("headers.json is corrupted, clearing")
-            self.clear()
-            return None
-        except Exception as e:
-            # 网络错误、认证过期等其他异常
-            _log.warning(f"Login failed: {e}")
-            return None
+            Path(name).unlink(missing_ok=True)
 
     def clear(self):
         for name in ("session.json", "headers.json", "cookies.txt"):

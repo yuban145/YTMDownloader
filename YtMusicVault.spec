@@ -12,7 +12,9 @@ a = Analysis(
     binaries=[],
     datas=[
         ('GUIDE.md', '.'),
-    ] + collect_data_files('ytmusicapi') + copy_metadata('ytmusicapi'),
+    ] + collect_data_files('ytmusicapi') + copy_metadata('ytmusicapi')
+      + collect_data_files('dukpy', includes=['jsruntime/*'])
+      + collect_data_files('publicsuffixlist', includes=['public_suffix_list.dat']),
     hiddenimports=[
         'ytmusicapi',
         'ytmusicapi.auth',
@@ -24,6 +26,8 @@ a = Analysis(
         'mutagen.id3',
         'requests',
         'socks',
+        'pypac',
+        'dukpy',
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',

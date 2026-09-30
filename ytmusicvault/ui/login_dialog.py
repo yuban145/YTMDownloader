@@ -30,8 +30,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.auth import AuthManager, BROWSERS, LoginRequest, detect_browsers
-from ..ui.login_browser import LoginBrowserWidget
-from ..ui.styles import DARK_THEME
 from .embedded_browser import EmbeddedBrowserDialog
 
 
@@ -97,9 +95,10 @@ class LoginDialog(QDialog):
     login_done = Signal()
     submitted = Signal(object)
 
-    def __init__(self, auth: AuthManager | None = None, parent=None):
+    def __init__(self, auth: AuthManager | None = None, parent=None, proxy_url=None):
         super().__init__(parent)
         self._auth = auth
+        self._proxy_url = proxy_url
         self._result = False
         self._embedded = None
         self._busy = False
@@ -185,13 +184,6 @@ class LoginDialog(QDialog):
         file_layout.addRow("Google 账号序号", self.file_account)
         self.tabs.addTab(file_tab, "Cookie 文件")
 
-        # Current-branch compatibility section
-        if self._auth is not None and self._auth.has_cookies:
-            status = QLabel("✅ 已有 Cookies 登录凭据，可直接使用")
-            status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            status.setStyleSheet("color: #a6e3a1;")
-            layout.addWidget(status)
-
         self._cookie_help_btn = QPushButton("📖  什么是 Cookies 文件？如何获取？")
         self._cookie_help_btn.setObjectName("secondaryBtn")
         self._cookie_help_btn.clicked.connect(self._show_cookie_help)
@@ -207,64 +199,6 @@ class LoginDialog(QDialog):
         self.submit = QPushButton("连接音乐库")
         self.submit.clicked.connect(self._submit)
         layout.addWidget(self.submit)
-
-        self._oauth_status = QLabel("")
-        self._oauth_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._oauth_status.setWordWrap(True)
-        self._oauth_status.setVisible(False)
-        layout.addWidget(self._oauth_status)
-
-    # ── Embedded browser login ──────────────────────────
-
-    def _do_login_browser(self):
-        """Open embedded browser login and keep the old flow available."""
-        if self._auth is None:
-            self._open_embedded()
-            return
-
-        self._login_window = QWidget()
-        self._login_window.setWindowTitle("YtMusicVault — 登录 YouTube Music")
-        self._login_window.resize(800, 650)
-        self._login_window.setMinimumSize(700, 500)
-
-        login_layout = QVBoxLayout(self._login_window)
-        login_layout.setContentsMargins(0, 0, 0, 0)
-        login_layout.setSpacing(0)
-
-        self._login_browser = LoginBrowserWidget(self._auth.cookies_path)
-        self._login_browser.login_success.connect(self._on_browser_success)
-        self._login_browser.login_failed.connect(self._on_browser_failed)
-        login_layout.addWidget(self._login_browser)
-
-        self._login_window.setStyleSheet(DARK_THEME)
-        self._login_window.show()
-
-        self._oauth_status.setText("⏳ 请在弹窗中登录你的 Google 账号...")
-        self._oauth_status.setStyleSheet("color: #f9e2af; padding: 8px;")
-        self._oauth_status.setVisible(True)
-
-    def _on_browser_success(self):
-        """Login browser succeeded — cookies saved."""
-        if hasattr(self, '_login_window') and self._login_window:
-            self._login_window.close()
-
-        self._result = True
-        self.login_done.emit()
-        self.submitted.emit(LoginRequest("browser", "embedded", remember=self.remember.isChecked()))
-        self.message.setText("✅ 登录成功！")
-        self._oauth_status.setText("✅ 登录成功！")
-        self._oauth_status.setStyleSheet("color: #a6e3a1; padding: 8px;")
-        self._oauth_status.setVisible(True)
-
-    def _on_browser_failed(self, error_msg: str):
-        """Login browser failed."""
-        if hasattr(self, '_login_window') and self._login_window:
-            self._login_window.close()
-
-        self.message.setText(f"❌ {error_msg}")
-        self._oauth_status.setText(f"❌ {error_msg}")
-        self._oauth_status.setStyleSheet("color: #f38ba8; padding: 8px;")
-        self._oauth_status.setVisible(True)
 
     # ── Browser/header/file submission ──────────────────────
 
@@ -283,7 +217,11 @@ class LoginDialog(QDialog):
             self._embedded.show()
             self._embedded.raise_()
             return
-        self._embedded = EmbeddedBrowserDialog(self)
+        try:
+            self._embedded = EmbeddedBrowserDialog(self, proxy_url=self._proxy_url)
+        except Exception:
+            self.message.setText("无法启动内置浏览器，请检查代理或 PAC 配置。")
+            return
         self._embedded.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._embedded.submitted.connect(self._submit_embedded)
         self._embedded.finished.connect(lambda *_: setattr(self, "_embedded", None))
@@ -315,29 +253,6 @@ class LoginDialog(QDialog):
             )
         else:
             path = self.file.text().strip()
-            if path and self._auth is not None:
-                try:
-                    self._auth.import_cookies(path)
-                    self._result = True
-                    self.login_done.emit()
-                    self.message.setText("✅ Cookies 已导入并生成认证 headers，正在验证登录。")
-                    self.submitted.emit(
-                        LoginRequest(
-                            "file",
-                            path,
-                            account_index=str(self.file_account.value()),
-                            remember=self.remember.isChecked(),
-                        )
-                    )
-                    return
-                except (ValueError, OSError) as e:
-                    QMessageBox.critical(
-                        self,
-                        "导入失败",
-                        f"无法复制 Cookies 文件：{str(e)}\n\n"
-                        "💡 推荐使用内嵌浏览器直接登录，更方便！",
-                    )
-                    return
             request = LoginRequest(
                 "file",
                 path,

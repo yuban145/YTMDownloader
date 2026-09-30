@@ -13,6 +13,7 @@ import psutil
 
 from ..models.song import DownloadStatus
 from ..utils.helpers import parse_ytdlp_progress
+from ..utils.proxy import resolve_proxy_url
 
 RESULT_PREFIX = "__YTMV_FILE__:"
 
@@ -206,7 +207,7 @@ class Downloader:
         # None follows environment and Windows static system proxy; "" forces
         # direct. --ignore-config prevents external yt-dlp config overriding us.
         if self._proxy_url is not None:
-            cmd += ["--proxy", self._proxy_url]
+            cmd += ["--proxy", resolve_proxy_url(self._proxy_url)]
         for runtime in ("deno", "node"):
             executable = shutil.which(runtime)
             if executable:

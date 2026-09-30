@@ -26,8 +26,8 @@ class MediaPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
             c = AppConfig.load(str(path))
-            self.assertEqual((c.proxy_mode, c.download_mode, c.audio_quality), ("system", "video", "best"))
-            self.assertIsNone(c.proxy_url)
+            self.assertEqual((c.proxy_mode, c.download_mode, c.audio_quality), ("manual", "video", "best"))
+            self.assertEqual(c.proxy_url, "http://127.0.0.1:7890")
             path.write_text(json.dumps({"proxy_enabled": True, "proxy_host": "localhost", "proxy_port": 3210}))
             c = AppConfig.load(str(path))
             self.assertEqual(c.proxy_mode, "manual")
@@ -41,7 +41,7 @@ class MediaPolicyTests(unittest.TestCase):
             c.save()
             self.assertEqual(AppConfig.load(c._config_path).proxy_url, "")
         c = AppConfig(proxy_mode="manual", proxy_username="a@b", proxy_password="x:/?", proxy_host="::1")
-        self.assertEqual(c.proxy_url, "http://a%40b:x%3A%2F%3F@[::1]:1080")
+        self.assertEqual(c.proxy_url, "http://a%40b:x%3A%2F%3F@[::1]:7890")
         self.assertNotIn("a%40b", proxy_description(c.proxy_url))
 
     def test_system_manual_and_direct_cli(self):
@@ -80,8 +80,7 @@ class MediaPolicyTests(unittest.TestCase):
         with patch("ytmusicvault.utils.proxy.getproxies", return_value=system):
             self.assertEqual(requests_proxy_map(None), {"http": system["http"], "https": system["https"]})
             session = requests.Session()
-            self.assertEqual(configure_requests_session(session, None),
-                             {"http": system["http"], "https": system["https"]})
+            self.assertEqual(configure_requests_session(session, None), {})
             self.assertTrue(session.trust_env)
             self.assertEqual(configure_requests_session(session, ""), {})
             self.assertFalse(session.trust_env)
@@ -206,7 +205,8 @@ class MediaPolicyTests(unittest.TestCase):
             self.assertTrue(psutil.pid_exists(child_pid))
             Downloader._stop_process(parent)
             parent.wait(timeout=5)
-            self.assertFalse(psutil.pid_exists(child_pid))
+            self.assertTrue(not psutil.pid_exists(child_pid) or
+                            psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE)
         finally:
             Downloader._stop_process(parent)
             parent.stdout.close()

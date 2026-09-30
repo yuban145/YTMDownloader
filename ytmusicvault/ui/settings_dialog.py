@@ -1,4 +1,4 @@
-"""Download and network preferences; system proxy is the first-run default."""
+"""Download and network preferences; localhost:7890 is the first-run default."""
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout, QWidget,
     QScrollArea, QLabel, QLineEdit, QSpinBox, QComboBox, QPushButton, QFileDialog,
     QCheckBox, QDialogButtonBox, QMessageBox)
@@ -52,8 +52,8 @@ class SettingsDialog(QDialog):
         form.addRow("重试间隔（秒）", self._delay_spin)
 
         self._proxy_mode = QComboBox()
-        for label, value in (("跟随系统代理（默认，无需填写）", "system"),
-                             ("手动代理", "manual"), ("仅下载直连（音乐库保持原连接）", "direct")):
+        for label, value in (("跟随系统代理", "system"),
+                             ("手动代理（默认 127.0.0.1:7890）", "manual"), ("直连", "direct"), ("PAC 自动代理", "pac")):
             self._proxy_mode.addItem(label, value)
         form.addRow("网络连接", self._proxy_mode)
         self._proxy_status = QLabel()
@@ -74,6 +74,14 @@ class SettingsDialog(QDialog):
         self._password = QLineEdit(config.proxy_password)
         self._password.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("密码（可选）", self._password)
+        self._pac = QLineEdit(config.proxy_pac_url)
+        self._pac.setPlaceholderText("http://127.0.0.1:7890/proxy.pac 或本地 .pac 文件")
+        self._pac_browse = QPushButton("选择 PAC 文件…")
+        self._pac_browse.clicked.connect(self._browse_pac)
+        pac_row = QHBoxLayout()
+        pac_row.addWidget(self._pac)
+        pac_row.addWidget(self._pac_browse)
+        form.addRow("PAC 地址 / 文件", pac_row)
         self._manual_fields = [self._proxy_type, self._host, self._port, self._user, self._password]
         self._proxy_mode.currentIndexChanged.connect(self._proxy_changed)
         self._proxy_mode.setCurrentIndex(max(0, self._proxy_mode.findData(config.proxy_mode)))
@@ -96,9 +104,14 @@ class SettingsDialog(QDialog):
         mode = self._proxy_mode.currentData()
         for widget in self._manual_fields:
             widget.setEnabled(mode == "manual")
+        self._pac.setEnabled(mode == "pac")
+        self._pac_browse.setEnabled(mode == "pac")
+        if mode == "pac":
+            self._proxy_status.setText("按 PAC 规则连接。支持 HTTP/HTTPS 地址或本地文件；每 5 分钟重新加载。失败时仅按 PAC 中列出的后备路线重试。")
+            return
         self._proxy_status.setText(proxy_description(None) if mode == "system" else
-                                   ("音乐库、MV 查询、媒体下载和封面请求都会使用下面的手动代理。" if mode == "manual" else
-                                    "新的音乐库、MV 查询、媒体下载和封面请求将直连。已登录会话需重新登录后应用。"))
+                                   ("新建音乐库会话、内置浏览器、MV 查询、媒体下载和封面请求都会使用下面的手动代理。" if mode == "manual" else
+                                    "新的音乐库、MV 查询、媒体下载和封面请求将直连。已登录会话需重新登录，内置浏览器需重新打开后应用。"))
 
     def _on_save(self):
         if not self._dir_input.text().strip():
@@ -107,11 +120,15 @@ class SettingsDialog(QDialog):
         if self._proxy_mode.currentData() == "manual" and not self._host.text().strip():
             QMessageBox.warning(self, "设置无效", "请输入代理主机。")
             return
+        if self._proxy_mode.currentData() == "pac" and not self._pac.text().strip():
+            QMessageBox.warning(self, "设置无效", "请输入 PAC 地址或选择本地文件。")
+            return
         c = self._config
         c.download_dir = self._dir_input.text().strip()
         c.audio_quality = self._quality_combo.currentData()
         c.concurrent_downloads = self._concurrency_spin.value()
         c.max_retries, c.retry_delay = self._retry_spin.value(), self._delay_spin.value()
+        c.proxy_pac_url = self._pac.text().strip()
         c.proxy_mode = self._proxy_mode.currentData()
         c.proxy_enabled = c.proxy_mode == "manual"  # legacy compatibility
         c.proxy_type, c.proxy_host, c.proxy_port = self._proxy_type.currentText(), self._host.text().strip(), self._port.value()
@@ -119,6 +136,11 @@ class SettingsDialog(QDialog):
         c.filename_template = self._template.text().strip() or "{artist} - {title}.{ext}"
         c.create_playlist_folders = self._folder.isChecked()
         self.accept()
+
+    def _browse_pac(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 PAC 文件", "", "PAC 文件 (*.pac *.dat);;所有文件 (*)")
+        if path:
+            self._pac.setText(path)
 
     def _browse_dir(self):
         directory = QFileDialog.getExistingDirectory(self, "选择下载目录", self._dir_input.text())

@@ -112,6 +112,15 @@ class LocalMediaTests(unittest.TestCase):
         self.assertEqual(tags["title"], song.title)
         self.assertEqual(tags["artist"], song.artist)
 
+    def test_video_pac_routes_real_ytdlp_download(self):
+        self.requests.clear()
+        pac = self.root / "media.pac"
+        pac.write_text('function FindProxyForURL(url, host) { return "PROXY 127.0.0.1:'
+                       + str(self.server.server_port) + '; DIRECT"; }')
+        song = self.download_fixture("video", "pac:" + str(pac), proxy_env=True)
+        self.assertTrue(any(x.startswith("http://fixture.invalid/") for x in self.requests))
+        self.assertEqual({s["codec_type"] for s in self.probe(song.file_path)["streams"]}, {"video", "audio"})
+
     def test_audio_direct_connection_overrides_proxy_environment(self):
         self.requests.clear()
         song = self.download_fixture("audio", "")

@@ -10,6 +10,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout
 
 from ..core.auth import LoginRequest
+from ..utils.proxy import configure_qt_proxy
 
 
 def youtube_cookie_line(cookie):
@@ -53,8 +54,9 @@ class _BrowserView(QWebEngineView):
 class EmbeddedBrowserDialog(QDialog):
     submitted = Signal(object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, proxy_url=None):
         super().__init__(parent)
+        configure_qt_proxy(proxy_url)
         self.setWindowTitle("内置浏览器 · YouTube Music")
         self.resize(1050, 800)
         # Unnamed profile keeps web content and cookies in memory only.
@@ -69,6 +71,7 @@ class EmbeddedBrowserDialog(QDialog):
         note.setWordWrap(True)
         layout.addWidget(note)
         self._view = _BrowserView(self._profile, self)
+        self._view.page().proxyAuthenticationRequired.connect(self._proxy_auth)
         layout.addWidget(self._view, 1)
         row = QHBoxLayout()
         refresh = QPushButton("刷新页面")
@@ -87,6 +90,13 @@ class EmbeddedBrowserDialog(QDialog):
         layout.addWidget(self._message)
         store.loadAllCookies()
         self._view.setUrl(QUrl("https://music.youtube.com"))
+
+    @staticmethod
+    def _proxy_auth(url, authenticator, host):
+        from PySide6.QtNetwork import QNetworkProxy
+        proxy = QNetworkProxy.applicationProxy()
+        authenticator.setUser(proxy.user())
+        authenticator.setPassword(proxy.password())
 
     @staticmethod
     def _key(cookie):

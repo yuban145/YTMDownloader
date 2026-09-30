@@ -209,7 +209,7 @@ class MainWindow(QMainWindow):
             account_id = self._active_account_id or "default"
             label = self._accounts.label(account_id) or self._pending_account_label or "当前账号"
             self._login_target = (account_id, label)
-        self._login_dialog = LoginDialog(self)
+        self._login_dialog = LoginDialog(parent=self, proxy_url=self._config.proxy_url)
         self._login_dialog.remember.setChecked(new)
         self._login_dialog.submitted.connect(self._submit_login)
         self._login_dialog.finished.connect(self._login_dialog_closed)
@@ -432,7 +432,7 @@ class MainWindow(QMainWindow):
             self._config.save()
             self._proxy_label.setText(proxy_description(self._config.proxy_url))
             if previous_proxy != self._config.proxy_url and self.library.client:
-                self._message.setText("下载代理设置已更新。若要切换音乐库使用的系统或手动代理，请重新登录。")
+                self._message.setText("代理设置已更新。已连接的音乐库需重新登录，已打开的内置浏览器需关闭后重新打开。")
 
     def _download_playlist(self):
         if self._songs:

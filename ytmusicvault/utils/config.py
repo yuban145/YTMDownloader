@@ -40,11 +40,12 @@ class AppConfig:
     retry_delay: int = 5               # 重试间隔（秒）
 
     # ── 代理设置（防火墙后用户） ────────────────────────
-    proxy_enabled: bool = False        # 是否启用代理
-    proxy_mode: str = "system"         # system / manual / direct
+    proxy_enabled: bool = True        # 是否启用代理
+    proxy_mode: str = "manual"         # system / manual / direct / pac
     proxy_type: str = "http"           # 代理类型：http, socks5
     proxy_host: str = "127.0.0.1"      # 代理主机
-    proxy_port: int = 1080             # 代理端口
+    proxy_port: int = 7890             # 代理端口
+    proxy_pac_url: str = ""            # PAC URL or local file path
     proxy_username: str = ""           # 代理用户名（可选）
     proxy_password: str = ""           # 代理密码（可选）
 
@@ -70,6 +71,8 @@ class AppConfig:
             return None  # requests / yt-dlp inherit environment + Windows proxy settings
         if self.proxy_mode == "direct":
             return ""
+        if self.proxy_mode == "pac":
+            return "pac:" + self.proxy_pac_url.strip()
         auth = ""
         if self.proxy_username:
             auth = f"{quote(self.proxy_username, safe='')}:{quote(self.proxy_password, safe='')}@"
@@ -99,6 +102,7 @@ class AppConfig:
             "retry_delay": self.retry_delay,
             "proxy_enabled": self.proxy_enabled,
             "proxy_mode": self.proxy_mode,
+            "proxy_pac_url": self.proxy_pac_url,
             "proxy_type": self.proxy_type,
             "proxy_host": self.proxy_host,
             "proxy_port": self.proxy_port,
@@ -138,10 +142,11 @@ class AppConfig:
                 for key, value in data.items():
                     if key in cls.__dataclass_fields__ and not key.startswith("_"):
                         setattr(config, key, value)
-                if "proxy_mode" not in data:
-                    config.proxy_mode = "manual" if data.get("proxy_enabled") else "system"
-                if config.proxy_mode not in ("system", "manual", "direct"):
-                    config.proxy_mode = "system"
+                if "proxy_mode" not in data and "proxy_enabled" in data:
+                    config.proxy_mode = "manual" if data["proxy_enabled"] else "system"
+                if config.proxy_mode not in ("system", "manual", "direct", "pac"):
+                    config.proxy_mode = "manual"
+                config.proxy_enabled = config.proxy_mode == "manual"
                 if config.download_mode not in ("video", "audio"):
                     config.download_mode = "video"
                 if config.audio_format not in ("flac", "mp3", "m4a"):

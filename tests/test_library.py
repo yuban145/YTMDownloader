@@ -106,7 +106,7 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(account, {"accountName": "账号未验证", "verified": False, "identityAvailable": False})
         client.close()
 
-    def test_ytmusic_requests_receive_explicit_system_proxy_map(self):
+    def test_ytmusic_system_proxy_is_resolved_per_request(self):
         api = Mock()
         api.get_account_info.return_value = {}
         system_proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
@@ -114,8 +114,8 @@ class LibraryTests(unittest.TestCase):
                 patch("ytmusicvault.core.ytm_client.YTMusic", return_value=api) as factory:
             client, _ = YtmClient.connect(normalize_headers({"cookie": "__Secure-3PAPISID=fake"}))
         session = factory.call_args.kwargs["requests_session"]
-        self.assertEqual(session.proxies, system_proxies)
-        self.assertEqual(factory.call_args.kwargs["proxies"], system_proxies)
+        self.assertEqual(session.proxies, {})
+        self.assertIsNone(factory.call_args.kwargs["proxies"])
         self.assertTrue(session.trust_env)
         client.close()
 

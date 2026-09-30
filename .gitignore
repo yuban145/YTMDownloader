@@ -27,3 +27,8 @@ Thumbs.db
 
 # Build artifacts
 *.exe
+
+# Local diagnostics and downloaded test fixtures
+test-output/
+err.txt
+*.log

@@ -67,8 +67,11 @@ if __name__ == "__main__":
                 with OfflineSession() as session:
                     api = YTMusic(auth=credentials.headers, requests_session=session, language="en")
                     assert "SAPISIDHASH" in api.headers["authorization"]
+                from pypac.parser import PACFile
+                pac = PACFile('function FindProxyForURL(url, host) { return "DIRECT"; }')
+                assert pac.find_proxy_for_url("https://example.test/", "example.test") == "DIRECT"
                 app = YtMusicVaultApp(auto_restore=False)
-                login = LoginDialog(app._window)
+                login = LoginDialog(parent=app._window)
                 settings = SettingsDialog(app._window._config, app._window)
                 app._app.processEvents()
                 login.close()
