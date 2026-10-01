@@ -18,11 +18,18 @@ from PySide6.QtWidgets import (
     QHeaderView, QCheckBox, QPushButton, QLineEdit, QLabel,
     QAbstractItemView, QMenu,
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QSignalBlocker
 from PySide6.QtGui import QColor
 from pathlib import Path
 
 from ..models.song import Song, DownloadStatus
+
+
+class _SelectAllCheckBox(QCheckBox):
+    def nextCheckState(self):
+        # Partial selection is an aggregate display state, not a click target.
+        self.setCheckState(Qt.CheckState.Unchecked if self.checkState() == Qt.CheckState.Checked
+                           else Qt.CheckState.Checked)
 
 
 class SongListWidget(QWidget):
@@ -57,7 +64,7 @@ class SongListWidget(QWidget):
         toolbar = QHBoxLayout()
 
         # 全选复选框（三态：全选/半选/未选）
-        self._select_all_cb = QCheckBox("全选")
+        self._select_all_cb = _SelectAllCheckBox("全选")
         self._select_all_cb.setTristate(True)  # 允许半选状态
         self._select_all_cb.stateChanged.connect(self._on_select_all)
         toolbar.addWidget(self._select_all_cb)
@@ -209,8 +216,6 @@ class SongListWidget(QWidget):
         self._table.blockSignals(False)
 
         self._update_info()
-        # 填充后重置全选复选框
-        self._select_all_cb.setCheckState(Qt.CheckState.Unchecked)
 
     def _create_row(self, row: int, song: Song):
         """为表格创建一行数据。
@@ -282,6 +287,9 @@ class SongListWidget(QWidget):
         Args:
             song: 状态已变更的 Song 对象
         """
+        for index, current in enumerate(self._songs):
+            if current.video_id == song.video_id:
+                self._songs[index] = song
         for row, s in enumerate(self._filtered_songs):
             if s.video_id == song.video_id:
                 self._set_status_cell(row, song.status)
@@ -293,6 +301,10 @@ class SongListWidget(QWidget):
         """Update info label and download button."""
         total = len(self._filtered_songs)
         selected = len(self.get_selected_songs())
+        state = (Qt.CheckState.Unchecked if selected == 0 else
+                 Qt.CheckState.Checked if selected == total else Qt.CheckState.PartiallyChecked)
+        with QSignalBlocker(self._select_all_cb):
+            self._select_all_cb.setCheckState(state)
         self._info_label.setText(f"共 {total} 首歌，已选 {selected} 首")
         self._download_btn.setEnabled(selected > 0)
         self._download_btn.setText(f"⬇ 下载选中 ({selected})")

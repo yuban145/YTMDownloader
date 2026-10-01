@@ -81,8 +81,7 @@ if ($Clean) {
 }
 
 if (-not $SkipInstall) {
-    Invoke-Checked $python @("-m", "pip", "install", "-r", "requirements.txt")
-    Invoke-Checked $python @("-m", "pip", "install", "pyinstaller")
+    Invoke-Checked $python @("-m", "pip", "install", "-r", "requirements-build.txt")
 }
 
 Invoke-Checked $python @("-m", "compileall", "-q", "ytmusicvault")

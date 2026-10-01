@@ -2,6 +2,7 @@ import json
 import tempfile
 import time
 import unittest
+import warnings
 from pathlib import Path
 from http.cookiejar import Cookie, CookieJar, MozillaCookieJar
 from unittest.mock import patch
@@ -44,6 +45,12 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(credentials.headers["x-goog-pageid"], "brand-channel")
             self.assertNotIn("host", credentials.headers)
             self.assertNotEqual(credentials.headers["authorization"], "SAPISIDHASH stale")
+
+    def test_windows_copied_headers_accept_crlf(self):
+        raw = headers()
+        credentials = parse_headers("\r\n".join(f"{key}: {value}" for key, value in raw.items()))
+        self.assertEqual(credentials.headers["cookie"], raw["Cookie"])
+        self.assertEqual(credentials.headers["x-goog-authuser"], "1")
 
     def test_invalid_credentials_never_replace_saved_session(self):
         self.manager.save(normalize_headers(headers()))
@@ -99,6 +106,19 @@ class AuthTests(unittest.TestCase):
             with self.assertRaises(AuthError):
                 self.manager.prepare(LoginRequest("file", str(file)))
 
+    def test_malformed_cookie_fields_never_emit_credential_warnings(self):
+        contents = ("# Netscape HTTP Cookie File\n"
+                    ".youtube.com\tTRUE\t/\tTRUE\tsynthetic-secret\t__Secure-3PAPISID\tvalue\n")
+        file = Path(self.tmp.name) / "malformed.txt"
+        file.write_text(contents, encoding="utf-8")
+        for request in (LoginRequest("file", str(file)), LoginRequest("embedded", contents)):
+            with self.subTest(kind=request.kind), warnings.catch_warnings(record=True) as logged:
+                warnings.simplefilter("always")
+                with self.assertRaises(AuthError) as error:
+                    self.manager.prepare(request)
+                self.assertNotIn("synthetic-secret", str(error.exception))
+                self.assertEqual(logged, [])
+
     def test_atomic_save_reload_legacy_migration_logout(self):
         legacy = Path(self.tmp.name) / "headers.json"
         legacy.write_text(json.dumps(headers()), encoding="utf-8")
@@ -133,7 +153,9 @@ class AuthTests(unittest.TestCase):
 
     def test_control_characters_and_missing_account_rejected(self):
         for data in ({"cookie": "SID=x"}, {"cookie": "__Secure-3PAPISID=x\r\nCookie: leak"},
-                     {"cookie": "__Secure-3PAPISID=x", "x-goog-authuser": "-1"}, []):
+                     {"cookie": "__Secure-3PAPISID=x", "x-goog-authuser": "-1"},
+                     {"cookie": "__Secure-3PAPISID=x", "x-goog-authuser": "²"},
+                     {"cookie": "__Secure-3PAPISID=x", "x-goog-authuser": "１"}, []):
             with self.assertRaises(AuthError):
                 normalize_headers(data)
 

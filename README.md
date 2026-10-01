@@ -1,6 +1,12 @@
-# YtMusicVault 2.1
+# YtMusicVault 2.1.1
 
 Windows 桌面 YouTube Music 音乐库下载工具。登录和歌单请求沿用最初版本的调用方式，网络访问仍在后台执行。
+
+## 下载发布版
+
+从 [GitHub Releases](https://github.com/yuban145/YTMDownloader/releases/latest) 下载 Windows x64 ZIP，解压后运行 `YtMusicVault.exe`。EXE 不需要安装 Python；请将 FFmpeg / ffprobe 和 Deno（或 Node.js）加入 PATH。发布包包含使用指南和更新记录，校验文件 `SHA256SUMS.txt` 可验证下载的 ZIP。
+
+登录时请导入自己的浏览器会话、请求头或 Netscape Cookie 文件。仓库和发布包不包含个人 Cookie；本地 `cookies.txt` 被 Git 忽略。
 
 > AI 辅助开发项目，请先用少量内容验证。仅下载您有权下载的内容，并遵守服务条款。
 
@@ -15,7 +21,7 @@ Windows 桌面 YouTube Music 音乐库下载工具。登录和歌单请求沿用
 - yt-dlp 下载使用当前导入的 YouTube 会话，每个并发任务独立临时 Cookie 文件；支持最高画质 MV、FLAC 与 MP3，并写入作者 / 艺术家等标签。
 - 主界面可下载选中歌曲或整个已加载歌单；「下载」页展示处理阶段、实时进度、失败重试与取消，以及跨重启保留的记录。双击完成项打开本地文件，右键可打开文件或源页面；详细日志可在日志页查看。
 - 多账号可分别保存会话并在顶部账号列表切换；旧版单账号会话原位保留，账号备注与当前选择写入 `accounts.json`，各账号 Cookie 仍由独立的 `session.json` 保存。登录验证和歌单接口未改动。
-- 「记住登录」默认关闭。只有读到个人歌单或收藏歌曲后才会替换先前保存的会话；开启后会话明文存入本机用户目录，退出登录则清除应用保存的会话，不影响浏览器本身。
+- 添加账号时默认勾选「记住登录」，重新登录已保存账号时保留勾选，可取消以仅使用本次会话。只有读到个人歌单或收藏歌曲后才会替换先前保存的会话；开启后会话明文存入本机用户目录，退出登录则清除应用保存的会话，不影响浏览器本身。
 
 这不是 OAuth 授权客户端，不收集 Google 密码。Chrome / Edge 的系统加密或文件锁可能阻止自动读取，失败时请用「请求头登录」，详细步骤见 [GUIDE.md](GUIDE.md)。
 
@@ -58,6 +64,14 @@ PAC 回归覆盖本地及远程规则文件、按主机选路、HTTP/SOCKS 代�
 
 可选的真实验收脚本 `tests/manual_embedded_browser_probe.py` 将提供的 Cookie 装入内存浏览器并验证页面和 Cookie 回传；`tests/manual_real_cookie_smoke.py` 用 Cookie 临时副本下载五秒真实视频，检查封装后的音视频流。脚本不会输出 Cookie 值。
 
+真实验收可指定源码或待测 EXE，例如：
+
+```powershell
+.\.venv-build\Scripts\python.exe -X utf8 -B tests/manual_real_cookie_smoke.py cookies.txt http://127.0.0.1:7890 source
+```
+
+脚本分别检查个人音乐库和真实下载；只有两者均通过才返回成功。公开视频可以下载不代表音乐库登录有效；服务端明确返回未登录时，应用会提示重新导出 Cookie，不再把它显示为空歌单。使用 SOCKS 代理时，`socks5` 由本机解析域名，`socks5h` 由代理解析；若本机 DNS 无法正常解析，可在设置中选择 `socks5h`。
+
 ## 结构
 
 - `core/auth.py`：凭据解析、浏览器导入、会话存储与旧文件兼容。
@@ -67,3 +81,5 @@ PAC 回归覆盖本地及远程规则文件、按主机选路、HTTP/SOCKS 代�
 - `ui/main_window.py`、`ui/login_dialog.py`：交互与状态展示。
 - `core/downloader.py`、`core/metadata.py`、`core/database.py`：下载工具、媒体标签和历史记录。
 - `tests/`：无需账号的回归测试。
+- `scripts/package_release.py`：仅打包 EXE 和发布文档，生成 SHA-256 校验文件。
+- `CHANGELOG.md`、`RELEASING.md`：版本变更及发布步骤。

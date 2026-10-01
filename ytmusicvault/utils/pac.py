@@ -4,6 +4,7 @@ HTTPS rules receive the origin URL (as with browser PAC privacy rules).
 TLS payloads are tunneled unchanged; only PAC scripts are downloaded here.
 """
 import atexit
+import base64
 import select
 import socket
 import ssl
@@ -20,6 +21,7 @@ from pypac.resolver import ProxyResolver
 
 _MAX_PAC = 1024 * 1024
 _HOP_HEADERS = {'connection', 'proxy-connection', 'proxy-authorization',
+                'proxy-authenticate',
                 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade'}
 _gateways = {}
 _gateway_lock = threading.Lock()
@@ -87,7 +89,11 @@ def _connect(route, host, port):
         if proxy.scheme == 'https':
             upstream = ssl.create_default_context().wrap_socket(upstream, server_hostname=proxy.hostname)
         authority = f'[{host}]:{port}' if ':' in host else f'{host}:{port}'
-        upstream.sendall(f'CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n'.encode('ascii'))
+        headers = [f'CONNECT {authority} HTTP/1.1', f'Host: {authority}']
+        if proxy.username is not None or proxy.password is not None:
+            credentials = f'{unquote(proxy.username or "")}:{unquote(proxy.password or "")}'.encode('utf-8')
+            headers.append('Proxy-Authorization: Basic ' + base64.b64encode(credentials).decode('ascii'))
+        upstream.sendall(('\r\n'.join(headers) + '\r\n\r\n').encode('ascii'))
         headers = bytearray()
         while not headers.endswith(b'\r\n\r\n'):
             byte = upstream.recv(1)
@@ -180,9 +186,17 @@ class _Handler(BaseHTTPRequestHandler):
                 with response:
                     started = True
                     self.send_response(response.status_code)
+                    response_hop = _HOP_HEADERS | {
+                        name.strip().lower()
+                        for name in response.headers.get('Connection', '').split(',')
+                    }
                     for key, value in response.headers.items():
-                        if key.lower() not in _HOP_HEADERS:
+                        if key.lower() not in response_hop and key.lower() != 'set-cookie':
                             self.send_header(key, value)
+                    # Set-Cookie is not a comma-combinable header. Requests'
+                    # mapping joins repeated values, so forward urllib3's list.
+                    for value in response.raw.headers.getlist('Set-Cookie'):
+                        self.send_header('Set-Cookie', value)
                     self.send_header('Connection', 'close')
                     self.end_headers()
                     if self.command != 'HEAD':

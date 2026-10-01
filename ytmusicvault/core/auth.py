@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import warnings
 from dataclasses import dataclass, field
 from http.cookiejar import MozillaCookieJar
 from http.cookies import SimpleCookie
@@ -63,7 +64,7 @@ def normalize_headers(raw, source="headers"):
     if any(any(c in item.value for c in "\r\n\t\x00") for item in jar.values()):
         raise AuthError("Cookie 内容含无效字符。")
     account = headers.get("x-goog-authuser", "0")
-    if not account.isdigit():
+    if not account.isascii() or not account.isdecimal():
         raise AuthError("账号序号必须是非负整数。")
     headers.update({"accept": "*/*", "content-type": "application/json",
                     "x-goog-authuser": account, "origin": ORIGIN, "x-origin": ORIGIN,
@@ -84,7 +85,7 @@ def parse_headers(text):
             raw = json.loads(text)
         else:
             from ytmusicapi import setup
-            raw = json.loads(setup(headers_raw=text))
+            raw = json.loads(setup(headers_raw=text.replace("\r\n", "\n")))
         return normalize_headers(raw)
     except AuthError:
         raise
@@ -150,6 +151,15 @@ class _QuietCookieLogger:
         raise AuthError("浏览器 Cookie 读取失败。请尝试请求头登录。")
 
 
+def _load_cookie_file(jar, path):
+    # MozillaCookieJar warns with the original parser traceback before raising
+    # LoadError. A malformed field can include a credential in that traceback.
+    # Turn this diagnostic into an exception handled by the safe import error.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", category=UserWarning, module=r"http\.cookiejar")
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+
+
 class AuthManager:
     def __init__(self, config_dir=None):
         self.directory = Path(config_dir or Path(os.environ.get("APPDATA", str(Path.home()))) / "YtMusicVault")
@@ -173,14 +183,14 @@ class AuthManager:
                 jar = extract_cookies_from_browser(request.value, request.profile or None,
                                                    logger=_QuietCookieLogger())
             elif request.kind == "file":
-                jar.load(request.value, ignore_discard=True, ignore_expires=True)
+                _load_cookie_file(jar, request.value)
             elif request.kind == "embedded":
                 # MozillaCookieJar's parser is file based; keep this temporary
                 # export isolated and delete it immediately after parsing.
                 with tempfile.TemporaryDirectory(prefix="ytmv-cookie-") as folder:
                     path = Path(folder) / "cookies.txt"
                     path.write_text(request.value, encoding="utf-8")
-                    jar.load(str(path), ignore_discard=True, ignore_expires=True)
+                    _load_cookie_file(jar, str(path))
             else:
                 raise AuthError("未知的登录方式。")
             credentials = from_cookie_jar(jar, request.kind, request.account_index)

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ytmusicvault.core.accounts import AccountStore
 from ytmusicvault.core.auth import AuthManager, normalize_headers
@@ -51,3 +52,42 @@ class AccountStoreTests(unittest.TestCase):
                                           "accounts": {"../../x": "escape"}}), encoding="utf-8")
         self.assertEqual(AccountStore(self.root).items(), [("default", "原账号")])
         self.assertIn("original", AuthManager(self.root).load().headers["cookie"])
+
+    def test_invalid_active_value_does_not_prevent_startup(self):
+        AuthManager(self.root).save(credentials("original"))
+        for active in ([], {}, None, 5):
+            with self.subTest(active=active):
+                (self.root / "accounts.json").write_text(json.dumps({
+                    "version": 1, "active": active, "accounts": {"default": "Account"}}), encoding="utf-8")
+                store = AccountStore(self.root)
+                self.assertEqual(store.active_id, "default")
+                self.assertEqual(store.items(), [("default", "Account")])
+
+    def test_failed_registration_is_retryable(self):
+        store = AccountStore(self.root)
+        account_id = store.new_id()
+        store.auth_for(account_id).save(credentials("original"))
+        with patch("ytmusicvault.core.accounts.os.replace", side_effect=OSError):
+            with self.assertRaises(OSError):
+                store.register(account_id, "Account")
+        self.assertEqual(store.items(), [])
+        self.assertEqual(store.active_id, "")
+        self.assertEqual(list(self.root.glob(".accounts-*")), [])
+        self.assertTrue(store.register(account_id, "Account"))
+        self.assertEqual(AccountStore(self.root).items(), [(account_id, "Account")])
+
+    def test_failed_selection_and_removal_preserve_index_and_memory(self):
+        store = AccountStore(self.root)
+        ids = [store.new_id(), store.new_id()]
+        for account_id in ids:
+            store.auth_for(account_id).save(credentials(account_id))
+            store.register(account_id, account_id)
+        original = store.path.read_bytes()
+        before = store.items()
+        with patch("ytmusicvault.core.accounts.os.replace", side_effect=OSError):
+            for operation in (lambda: store.activate(ids[0]), lambda: store.forget(ids[1])):
+                with self.assertRaises(OSError):
+                    operation()
+                self.assertEqual(store.active_id, ids[1])
+                self.assertEqual(store.items(), before)
+                self.assertEqual(store.path.read_bytes(), original)

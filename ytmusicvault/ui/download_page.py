@@ -170,7 +170,7 @@ class DownloadPage(QWidget):
             if not path.is_file():
                 continue
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()[-3000:]
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-3000:]
             except OSError:
                 continue
             for line in lines:

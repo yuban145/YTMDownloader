@@ -20,7 +20,8 @@ class AccountStore:
                 if isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("accounts"), dict):
                     self._accounts = {key: label for key, label in data["accounts"].items()
                                       if self._valid_id(key) and isinstance(label, str) and label.strip()}
-                    self._active = data.get("active", "")
+                    active = data.get("active", "")
+                    self._active = active if isinstance(active, str) else ""
             except (OSError, ValueError, TypeError):
                 pass
         # The original single-account session stays at the old location.
@@ -60,33 +61,33 @@ class AccountStore:
         label = label.strip() or "未命名账号"
         if self._accounts.get(account_id) == label and self._active == account_id:
             return True
-        self._accounts[account_id] = label
-        self._active = account_id
-        self._save()
+        self._save({**self._accounts, account_id: label}, account_id)
         return True
 
     def activate(self, account_id):
         if account_id not in self._accounts:
             raise KeyError(account_id)
-        self._active = account_id
-        self._save()
+        self._save(self._accounts, account_id)
 
     def forget(self, account_id):
-        self._accounts.pop(account_id, None)
-        if self._active == account_id:
-            self._active = next(iter(self._accounts), "")
-        self._save()
+        accounts = dict(self._accounts)
+        accounts.pop(account_id, None)
+        active = next(iter(accounts), "") if self._active == account_id else self._active
+        self._save(accounts, active)
 
-    def _save(self):
+    def _save(self, accounts, active):
         self.root.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=".accounts-", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 1, "active": self._active, "accounts": self._accounts},
+                json.dump({"version": 1, "active": active, "accounts": accounts},
                           stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(name, self.path)
+            # Commit memory only after the index is safely on disk. In particular,
+            # a failed register must remain retryable instead of looking saved.
+            self._accounts, self._active = accounts, active
         finally:
             if os.path.exists(name):
                 os.unlink(name)

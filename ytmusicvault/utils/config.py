@@ -4,13 +4,14 @@
 配置存储位置：%APPDATA%/YtMusicVault/config.json（Windows）
 
 设计要点：
-  - load() 使用 hasattr + setattr 动态加载 JSON 键值，兼容新增/删除字段
+  - load() 验证 JSON 字段类型和范围，兼容新增/删除字段
   - 配置损坏（JSONDecodeError）时静默回退到默认值，不阻塞启动
   - proxy_url 属性动态拼接完整代理 URL
 """
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -113,15 +114,26 @@ class AppConfig:
             "window_width": self.window_width,
             "window_height": self.window_height,
         }
-        os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
-        with open(self._config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        path = Path(self._config_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=path.name + ".", suffix=".tmp", delete=False) as f:
+                temporary = Path(f.name)
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> "AppConfig":
         """从磁盘加载配置，文件不存在或损坏时返回默认配置。
 
-        使用 hasattr + setattr 动态赋值，确保新增字段不会因旧 JSON 缺失而报错，
+        验证字段类型后赋值，确保新增字段不会因旧 JSON 缺失而报错，
         旧 JSON 中的废弃字段也会被忽略。
 
         Args:
@@ -138,11 +150,28 @@ class AppConfig:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                # 动态赋值：只设置 dataclass 中存在的字段
+                if not isinstance(data, dict):
+                    return config
+                ranges = {"concurrent_downloads": (1, 8), "max_retries": (0, 10),
+                          "retry_delay": (0, 60), "proxy_port": (1, 65535),
+                          "window_width": (320, 16384), "window_height": (240, 16384)}
+                choices = {"proxy_mode": ("system", "manual", "direct", "pac"),
+                           "proxy_type": ("http", "https", "socks5", "socks5h"),
+                           "download_mode": ("video", "audio"),
+                           "audio_format": ("flac", "mp3", "m4a")}
                 for key, value in data.items():
-                    if key in cls.__dataclass_fields__ and not key.startswith("_"):
-                        setattr(config, key, value)
-                if "proxy_mode" not in data and "proxy_enabled" in data:
+                    if key not in cls.__dataclass_fields__ or key.startswith("_"):
+                        continue
+                    if type(value) is not type(getattr(config, key)):
+                        continue
+                    if key in ranges and not ranges[key][0] <= value <= ranges[key][1]:
+                        continue
+                    if key in choices and value not in choices[key]:
+                        continue
+                    if key in ("download_dir", "proxy_host", "filename_template") and not value.strip():
+                        continue
+                    setattr(config, key, value)
+                if "proxy_mode" not in data and isinstance(data.get("proxy_enabled"), bool):
                     config.proxy_mode = "manual" if data["proxy_enabled"] else "system"
                 if config.proxy_mode not in ("system", "manual", "direct", "pac"):
                     config.proxy_mode = "manual"
@@ -151,7 +180,7 @@ class AppConfig:
                     config.download_mode = "video"
                 if config.audio_format not in ("flac", "mp3", "m4a"):
                     config.audio_format = "mp3"
-            except (json.JSONDecodeError, OSError, AttributeError):
+            except (json.JSONDecodeError, OSError, UnicodeError):
                 # 配置文件损坏 → 静默使用默认配置，不阻塞启动
                 pass
         return config

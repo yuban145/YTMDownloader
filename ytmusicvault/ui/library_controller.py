@@ -55,6 +55,11 @@ class LibraryController(QObject):
     def restore(self, proxy_url=None):
         if self.auth.has_saved_session:
             self.login(LoginRequest("saved", remember=True), proxy_url)
+        else:
+            # A saved profile can lose its file after the account menu is built.
+            # Never retain the preceding account under the newly selected name.
+            self._invalidate()
+            self.signed_out.emit()
 
     def refresh(self):
         if self.client:

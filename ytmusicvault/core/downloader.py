@@ -72,6 +72,7 @@ class Downloader:
         song.error_msg = ""
         self._stalled.clear()
         watchdog_stop = threading.Event()
+        watchdog_thread = None
         try:
             if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
                 song.error_msg = "请安装 FFmpeg / ffprobe 并加入 PATH；最高画质视频需要合并音视频。"
@@ -93,12 +94,18 @@ class Downloader:
                 while not watchdog_stop.wait(1):
                     if process.poll() is not None:
                         return
+                    # Reading stdout may block during extraction or FFmpeg. An
+                    # external cancellation event must still stop the process.
+                    if self._cancelled.is_set() or (cancel_event and cancel_event.is_set()):
+                        self._stop_process(process)
+                        return
                     if time.monotonic() - last_output[0] >= self.MAX_IDLE_SECONDS:
                         self._stalled.set()
                         self._stop_process(process)
                         return
 
-            threading.Thread(target=watchdog, daemon=True).start()
+            watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+            watchdog_thread.start()
             if self._cancelled.is_set() or (cancel_event and cancel_event.is_set()):
                 self.cancel()
             if status_callback:
@@ -147,11 +154,13 @@ class Downloader:
             watchdog_stop.set()
             if self._process:
                 if self._process.poll() is None:
-                    self._process.kill()
+                    self._stop_process(self._process)
                 self._process.wait()
                 if self._process.stdout:
                     self._process.stdout.close()
                 self._process = None
+            if watchdog_thread:
+                watchdog_thread.join()
         if status_callback:
             status_callback(DownloadStatus.FAILED)
         return False
@@ -228,7 +237,9 @@ class Downloader:
         # being mistaken for an already downloaded file.
         template = re.sub(r"\.%\(ext\)s$", "", template)
         template += " [%(id)s].%(ext)s"
-        return os.path.join(base_dir, template)
+        # Folder names are literal, even when a playlist contains yt-dlp's
+        # percent syntax. Only the filename itself is an output template.
+        return os.path.join(str(base_dir).replace("%", "%%"), template)
 
 
 def _download_stage(line, audio_format, mode):

@@ -104,3 +104,11 @@ class DownloadPageTests(unittest.TestCase):
         self.assertIn("2", widget._download_playlist_btn.text())
         widget._on_download_playlist_clicked()
         self.assertEqual(emitted, [True])
+
+    def test_damaged_log_bytes_do_not_prevent_loading_valid_entries(self):
+        path = Path(self.tmp.name) / "download.log"
+        path.write_bytes(b'broken\xff\n{"title":"Track","event":"Done"}\n')
+        self.page.log_path = path
+        self.page.load_log_file()
+        self.assertIn("Track", self.page.log_view.toPlainText())
+        self.assertIn("Done", self.page.log_view.toPlainText())

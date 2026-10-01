@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
             label = self._accounts.label(account_id) or self._pending_account_label or "当前账号"
             self._login_target = (account_id, label)
         self._login_dialog = LoginDialog(parent=self, proxy_url=self._config.proxy_url)
-        self._login_dialog.remember.setChecked(new)
+        self._login_dialog.remember.setChecked(new or self.library.auth.has_saved_session)
         self._login_dialog.submitted.connect(self._submit_login)
         self._login_dialog.finished.connect(self._login_dialog_closed)
         self._login_dialog.show()

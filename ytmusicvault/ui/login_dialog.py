@@ -118,9 +118,9 @@ class LoginDialog(QDialog):
         open_button.clicked.connect(lambda: webbrowser.open("https://music.youtube.com"))
         layout.addWidget(open_button)
 
-        embedded_button = QPushButton("在内置浏览器登录…")
-        embedded_button.clicked.connect(self._open_embedded)
-        layout.addWidget(embedded_button)
+        self._embedded_button = QPushButton("在内置浏览器登录…")
+        self._embedded_button.clicked.connect(self._open_embedded)
+        layout.addWidget(self._embedded_button)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
@@ -213,6 +213,8 @@ class LoginDialog(QDialog):
             self.file.setText(path)
 
     def _open_embedded(self):
+        if self._busy:
+            return
         if self._embedded:
             self._embedded.show()
             self._embedded.raise_()
@@ -230,6 +232,8 @@ class LoginDialog(QDialog):
     def _submit_embedded(self, request):
         from dataclasses import replace
 
+        if self._busy:
+            return
         self.submitted.emit(replace(request, remember=self.remember.isChecked()))
 
     def _submit(self):
@@ -307,6 +311,9 @@ class LoginDialog(QDialog):
     def set_busy(self, busy):
         self._busy = busy
         self.submit.setEnabled(not busy)
+        self._embedded_button.setEnabled(not busy)
+        if self._embedded:
+            self._embedded.setEnabled(not busy)
         self.tabs.setEnabled(not busy)
         self.remember.setEnabled(not busy)
         if busy:
@@ -315,10 +322,13 @@ class LoginDialog(QDialog):
     def show_error(self, message):
         self.message.setText(message)
 
-    def reject(self):
+    def done(self, result):
         # Closing only hides input UI; the main window still owns verification.
         self.headers.clear()
-        super().reject()
+        if self._embedded:
+            self._embedded.close()
+            self._embedded = None
+        super().done(result)
 
     @property
     def login_successful(self) -> bool:

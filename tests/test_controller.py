@@ -182,6 +182,27 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(tracks[0][1].songs, [])
         self.assertIsNotNone(self.controller.client)
 
+    def test_restore_missing_account_session_disconnects_previous_account(self):
+        self.login()
+        signed_out = []
+        self.controller.signed_out.connect(lambda: signed_out.append(True))
+        self.controller.auth = AuthManager(Path(self.tmp.name) / "missing-account")
+        self.controller.restore()
+        self.assertIsNone(self.controller.client)
+        self.assertIsNone(self.controller.credentials)
+        self.assertEqual(signed_out, [True])
+        pump_until(lambda: self.client.closed)
+
+    def test_relogin_preserves_remembered_account_preference(self):
+        self.auth.save(normalize_headers({"cookie": "__Secure-3PAPISID=previous"}))
+        config = AppConfig(_config_path=str(Path(self.tmp.name) / "config-relogin.json"))
+        db = Database(str(Path(self.tmp.name) / "relogin.db"))
+        window = MainWindow(config, self.auth, db, auto_restore=False)
+        self.addCleanup(window.close)
+        window._login(new=False)
+        self.assertTrue(window._login_dialog.remember.isChecked())
+        window._login_dialog.reject()
+
     def test_main_window_end_to_end_with_fake_service(self):
         config = AppConfig(_config_path=str(Path(self.tmp.name) / "config.json"))
         db = Database(str(Path(self.tmp.name) / "test.db"))

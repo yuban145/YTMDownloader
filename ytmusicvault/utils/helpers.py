@@ -98,7 +98,10 @@ def safe_filename(name: str) -> str:
     Returns:
         安全的文件名（最多 200 字符）
     """
-    unsafe = '<>:"/\\|?*'
-    for ch in unsafe:
-        name = name.replace(ch, "_")
-    return name.strip()[:200]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    name = name.strip()[:200].rstrip('. ') or '_'
+    # Windows treats device names as reserved even when followed by an extension.
+    if re.fullmatch(r'CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]',
+                    name.split('.', 1)[0].rstrip(' '), re.IGNORECASE):
+        name = '_' + name
+    return name[:200].rstrip('. ')

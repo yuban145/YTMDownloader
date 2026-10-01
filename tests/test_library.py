@@ -1,3 +1,4 @@
+import json
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -38,6 +39,34 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(result[0].count, 0)
         self.assertEqual(result[1].count, 1234)
         self.assertTrue(result[1].owned)
+
+    def test_malformed_playlist_fields_do_not_hide_valid_playlists(self):
+        api = Mock()
+        api.get_library_playlists.return_value = [
+            {"playlistId": ["invalid"]}, {"playlistId": {"invalid": True}},
+            {"playlistId": "../invalid"},
+            {"playlistId": "PLvalid", "title": {"runs": None}, "thumbnails": 5},
+            {"playlistId": "PLother", "title": {"simpleText": "Other"}}]
+        result = YtmClient(api).get_playlists()
+        self.assertEqual([p.playlist_id for p in result], ["PLvalid", "PLother"])
+        self.assertEqual(result[0].title, "未命名歌单")
+        self.assertEqual(result[0].thumbnail, "")
+        self.assertEqual(result[1].title, "Other")
+
+    def test_invalid_track_ids_are_skipped_and_bad_optional_fields_are_tolerated(self):
+        api = Mock()
+        api.get_playlist.return_value = {"tracks": [
+            {"videoId": ["invalid"]}, {"videoId": "invalid&list=PLother"},
+            {"videoId": "valid", "title": {"runs": None}, "duration": "²:00",
+             "artists": [{"name": {"runs": 5}}], "album": {"name": {"runs": [None]}},
+             "thumbnails": [{"url": ["invalid"]}, {"url": "https://example.test/cover"}]}]}
+        result = YtmClient(api).get_tracks("PL1")
+        self.assertEqual(result.skipped, 2)
+        self.assertEqual(len(result.songs), 1)
+        self.assertEqual(result.songs[0].video_id, "valid")
+        self.assertEqual(result.songs[0].duration, 0)
+        self.assertEqual(result.songs[0].title, "未知标题")
+        self.assertEqual(result.songs[0].thumbnail, "https://example.test/cover")
 
     def test_playlist_signature_unavailable_tracks_and_duplicate_positions(self):
         class API:
@@ -82,7 +111,8 @@ class LibraryTests(unittest.TestCase):
 
     def test_playlist_link_validation(self):
         self.assertEqual(parse_playlist_id("https://music.youtube.com/playlist?list=PLabc&x=y"), "PLabc")
-        for value in ("https://evil.test/?list=PLx", "https://youtube.com/watch?v=x", "../x"):
+        for value in ("https://evil.test/?list=PLx", "https://youtube.com/watch?v=x", "../x",
+                      "https://[broken/?list=PLx", None, []):
             with self.assertRaises(ServiceError):
                 parse_playlist_id(value)
 
@@ -105,6 +135,48 @@ class LibraryTests(unittest.TestCase):
         self.assertIsNotNone(client)
         self.assertEqual(account, {"accountName": "账号未验证", "verified": False, "identityAvailable": False})
         client.close()
+
+    def test_malformed_identity_fields_do_not_become_account_names(self):
+        for identity in ({"accountName": ["unexpected"]}, {"accountName": {"text": "unexpected"}},
+                         {"accountName": "   "}, {"accountName": "Valid", "channelHandle": ["bad"]}):
+            with self.subTest(identity=identity):
+                api = Mock()
+                api.get_account_info.return_value = identity
+                with patch("ytmusicvault.core.ytm_client.YTMusic", return_value=api):
+                    client, result = YtmClient.connect(
+                        normalize_headers({"cookie": "__Secure-3PAPISID=fake"}))
+                if identity["accountName"] == "Valid":
+                    self.assertEqual(result["accountName"], "Valid")
+                    self.assertNotIn("channelHandle", result)
+                else:
+                    self.assertEqual(result["accountName"], "账号未验证")
+                    self.assertFalse(result["identityAvailable"])
+                client.close()
+
+    def test_account_validation_rejects_malformed_name(self):
+        for identity in ({"accountName": ["unexpected"]}, {"accountName": {"text": "unexpected"}},
+                         {"accountName": "  "}, []):
+            with self.subTest(identity=identity):
+                api = Mock()
+                api.get_account_info.return_value = identity
+                with self.assertRaises(SessionExpired):
+                    YtmClient(api).account()
+
+    def test_cancelled_identity_lookup_cancels_connection_and_closes_session(self):
+        api = Mock()
+        api.get_account_info.side_effect = Cancelled()
+        with patch("ytmusicvault.core.ytm_client.YTMusic", return_value=api), \
+                patch.object(HttpSession, "close") as close:
+            with self.assertRaises(Cancelled):
+                YtmClient.connect(normalize_headers({"cookie": "__Secure-3PAPISID=fake"}))
+        close.assert_called_once()
+
+    def test_proxy_setup_failure_closes_session(self):
+        with patch("ytmusicvault.core.ytm_client.configure_requests_session", side_effect=ValueError), \
+                patch.object(HttpSession, "close") as close:
+            with self.assertRaises(ValueError):
+                YtmClient.connect(normalize_headers({"cookie": "__Secure-3PAPISID=fake"}))
+        close.assert_called_once()
 
     def test_ytmusic_system_proxy_is_resolved_per_request(self):
         api = Mock()
@@ -135,6 +207,50 @@ class LibraryTests(unittest.TestCase):
             with self.assertRaises(Cancelled):
                 session.get("https://music.youtube.com/")
             request.assert_not_called()
+
+    def test_authenticated_music_api_detects_only_explicit_signed_out_markers(self):
+        session = HttpSession(authenticated=True)
+        self.addCleanup(session.close)
+
+        def response(payload):
+            result = requests.Response()
+            result.status_code = 200
+            result.headers["Content-Type"] = "application/json"
+            result._content = json.dumps(payload).encode()
+            return result
+
+        url = "https://music.youtube.com/youtubei/v1/browse"
+        good = response({"responseContext": {"serviceTrackingParams": [
+            {"params": [{"key": "logged_in", "value": "1"}]}]}})
+        absent = response({"contents": []})
+        malformed = response({"responseContext": {"serviceTrackingParams": {"params": "bad"}}})
+        signed_out = response({"responseContext": {"serviceTrackingParams": [
+            {"params": [{"key": "logged_in", "value": "0"}]}]}})
+        logged_out_context = response({"mainAppWebResponseContext": {"loggedOut": True}})
+        with patch.object(requests.Session, "request", side_effect=[good, absent, malformed,
+                                                                      signed_out, logged_out_context]):
+            self.assertIs(session.get(url), good)
+            self.assertIs(session.get(url), absent)
+            self.assertIs(session.get(url), malformed)
+            with self.assertRaises(SessionExpired):
+                session.get(url)
+            with self.assertRaises(SessionExpired):
+                session.get(url)
+
+    def test_signed_out_markers_on_unrelated_urls_or_unauthenticated_session_are_ignored(self):
+        payload = {"serviceTrackingParams": [{"params": [
+            {"key": "logged_in", "value": "0"}]}]}
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/json"
+        response._content = json.dumps(payload).encode()
+        authenticated = HttpSession(authenticated=True)
+        unauthenticated = HttpSession()
+        self.addCleanup(authenticated.close)
+        self.addCleanup(unauthenticated.close)
+        with patch.object(requests.Session, "request", return_value=response):
+            self.assertIs(authenticated.get("https://www.youtube.com/youtubei/v1/browse"), response)
+            self.assertIs(unauthenticated.get("https://music.youtube.com/youtubei/v1/browse"), response)
 
     def test_errors_do_not_leak_headers(self):
         self.assertNotIn("secret", user_error(ValueError("cookie=secret")))

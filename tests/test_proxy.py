@@ -16,7 +16,7 @@ import requests
 from PySide6.QtNetwork import QNetworkProxy
 from ytmusicvault.utils.config import AppConfig
 from ytmusicvault.utils.proxy import configure_requests_session, configure_qt_proxy, resolve_proxy_url
-from ytmusicvault.utils.pac import PacGateway, PacPolicy, _Handler
+from ytmusicvault.utils.pac import PacGateway, PacPolicy, _Handler, _connect
 from ytmusicvault.core.downloader import Downloader
 
 
@@ -118,6 +118,57 @@ class ProxyTests(unittest.TestCase):
         self.assertIn(f'127.0.0.1:{self.tls.server_port}', visits)
         direct = self.gateway('PROXY 127.0.0.1:1; DIRECT')
         self.assertEqual(self.session(direct.url).get(self.url, timeout=5).text, 'OK')
+
+    def test_http_response_preserves_repeated_set_cookie_and_strips_connection_headers(self):
+        class CookieOrigin(BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Set-Cookie', 'first=one; Path=/')
+                self.send_header('Set-Cookie', 'second=two; Path=/')
+                self.send_header('Connection', 'X-Origin-Hop')
+                self.send_header('X-Origin-Hop', 'must-not-cross-proxy')
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'OK')
+        origin = ThreadingHTTPServer(('127.0.0.1', 0), CookieOrigin)
+        threading.Thread(target=origin.serve_forever, daemon=True).start()
+        self.addCleanup(origin.server_close); self.addCleanup(origin.shutdown)
+        gateway = self.gateway('DIRECT')
+        with socket.create_connection(('127.0.0.1', gateway.server.server_port), timeout=5) as client:
+            client.sendall((f'GET http://127.0.0.1:{origin.server_port}/ HTTP/1.1\r\n'
+                            'Host: 127.0.0.1\r\nConnection: close\r\n\r\n').encode('ascii'))
+            response = bytearray()
+            while True:
+                block = client.recv(4096)
+                if not block:
+                    break
+                response.extend(block)
+        headers = bytes(response).split(b'\r\n\r\n', 1)[0]
+        self.assertEqual(headers.count(b'Set-Cookie:'), 2)
+        self.assertIn(b'first=one', headers)
+        self.assertIn(b'second=two', headers)
+        self.assertNotIn(b'X-Origin-Hop:', headers)
+        self.assertNotIn(b'Connection: X-Origin-Hop', headers)
+
+    def test_http_connect_upstream_sends_decoded_proxy_credentials(self):
+        received = []
+        class Proxy(socketserver.StreamRequestHandler):
+            def handle(self):
+                request = bytearray()
+                while not request.endswith(b'\r\n\r\n'):
+                    request.extend(self.rfile.read(1))
+                received.append(bytes(request))
+                self.wfile.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        proxy = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Proxy)
+        proxy.daemon_threads = True
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.server_close); self.addCleanup(proxy.shutdown)
+        tunnel = _connect(f'http://user%40name:p%3Ass@127.0.0.1:{proxy.server_address[1]}',
+                          'example.test', 443)
+        tunnel.close()
+        self.assertEqual(len(received), 1)
+        self.assertIn(b'Proxy-Authorization: Basic ' + b'dXNlckBuYW1lOnA6c3M=', received[0])
 
     def test_bad_pac_and_failed_proxy_never_silently_connect_directly(self):
         self.hits.clear()
